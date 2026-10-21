@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/zero469/opencode-relay-server/internal/tunnel"
 )
 
 // withTempConfigDir isolates all config reads/writes from the real HOME.
@@ -1650,5 +1652,895 @@ func TestGenerateEncryptionKeyPropagatesRandError(t *testing.T) {
 	}
 	if key != "" {
 		t.Fatalf("key = %q, want empty on failure", key)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Streaming responses and WebSocket forwarding (design D1/D2/D5).
+// ---------------------------------------------------------------------------
+
+// frameSink is a fake relay tunnel that decodes every frame the client writes,
+// both typed v2 frames and legacy TunnelResponse frames.
+func frameSink(t *testing.T) (*websocket.Conn, <-chan any) {
+	t.Helper()
+
+	frames := make(chan any, 256)
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				close(frames)
+				return
+			}
+			frame, err := tunnel.DecodeFrame(msg)
+			if err != nil {
+				continue
+			}
+			frames <- frame
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial test tunnel: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	return conn, frames
+}
+
+func nextFrame(t *testing.T, frames <-chan any, timeout time.Duration) any {
+	t.Helper()
+	select {
+	case frame, ok := <-frames:
+		if !ok {
+			t.Fatal("frame sink closed before a frame arrived")
+		}
+		return frame
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for a tunnel frame")
+		return nil
+	}
+}
+
+// streamTestClient wires a client to the given local HTTP server and a fake
+// relay sink.
+func streamTestClient(t *testing.T, localURL string) (*TunnelClient, <-chan any) {
+	t.Helper()
+
+	u, err := url.Parse(localURL)
+	if err != nil {
+		t.Fatalf("parse local server URL: %v", err)
+	}
+	conn, frames := frameSink(t)
+	client := &TunnelClient{
+		config:     &DeviceConfig{},
+		localPort:  u.Port(),
+		conn:       conn,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+		streamMode: true,
+	}
+	t.Cleanup(client.closeAllWs)
+	return client, frames
+}
+
+// sseRequest builds a tunnel request that asks for an event stream, which is
+// the only shape the relay forwards incrementally.
+func sseRequest(id, path string) *TunnelRequest {
+	return &TunnelRequest{
+		ID:      id,
+		Method:  "GET",
+		Path:    path,
+		Headers: map[string]string{"Accept": "text/event-stream"},
+	}
+}
+
+// A streaming response must start with res-head and then deliver the body in
+// ordered 32 KiB chunks, ending with res-end.
+func TestHandleRequestStreamsLargeBodyInOrder(t *testing.T) {
+	body := make([]byte, 100*1024+123)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Local", "yes")
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}))
+	t.Cleanup(local.Close)
+
+	client, frames := streamTestClient(t, local.URL)
+	done := make(chan struct{})
+	go func() {
+		client.handleRequest(sseRequest("r1", "/big"))
+		close(done)
+	}()
+
+	head, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.ResHead)
+	if !ok {
+		t.Fatal("first frame must be res-head")
+	}
+	if head.ID != "r1" || head.StatusCode != http.StatusOK {
+		t.Fatalf("res-head = %+v, want id r1 status 200", head)
+	}
+	if head.Headers["X-Local"] != "yes" {
+		t.Fatalf("res-head lost local header: %+v", head.Headers)
+	}
+
+	var got []byte
+	var wantSeq int64
+	sawEnd := false
+	for !sawEnd {
+		switch frame := nextFrame(t, frames, 5*time.Second).(type) {
+		case *tunnel.ResChunk:
+			if frame.Seq != wantSeq {
+				t.Fatalf("chunk seq = %d, want %d", frame.Seq, wantSeq)
+			}
+			if len(frame.Data) > 32*1024 {
+				t.Fatalf("chunk size = %d, want <= 32 KiB", len(frame.Data))
+			}
+			wantSeq++
+			got = append(got, frame.Data...)
+		case *tunnel.ResEnd:
+			sawEnd = true
+		case *tunnel.ResError:
+			t.Fatalf("unexpected res-error: %s", frame.Message)
+		default:
+			t.Fatalf("unexpected frame %T", frame)
+		}
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("streamed body mismatch: got %d bytes, want %d", len(got), len(body))
+	}
+	<-done
+}
+
+// A local read failure must be reported as res-error, not silently truncated.
+func TestHandleRequestStreamReadErrorSendsResError(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("response writer is not a hijacker")
+			return
+		}
+		conn, buf, err := hijacker.Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Promise 4096 bytes, deliver 7, then drop the connection.
+		fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nContent-Type: text/plain\r\n\r\npartial")
+		buf.Flush()
+	}))
+	t.Cleanup(local.Close)
+
+	client, frames := streamTestClient(t, local.URL)
+	go client.handleRequest(sseRequest("r1", "/broken"))
+
+	if _, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.ResHead); !ok {
+		t.Fatal("first frame must be res-head")
+	}
+	for {
+		switch frame := nextFrame(t, frames, 5*time.Second).(type) {
+		case *tunnel.ResChunk:
+			// Partial data may arrive before the failure is detected.
+		case *tunnel.ResError:
+			if frame.ID != "r1" || frame.Message == "" {
+				t.Fatalf("res-error = %+v, want id r1 with a message", frame)
+			}
+			return
+		case *tunnel.ResEnd:
+			t.Fatal("res-end must not follow a read failure")
+		}
+	}
+}
+
+// A v2 tunnel must still answer ordinary requests with a single legacy
+// TunnelResponse frame: the relay only streams SSE and drops typed frames for
+// everything else. Streaming a plain request here used to time out at 120s.
+func TestHandleRequestV2PlainRequestUsesLegacyPath(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "hello world")
+	}))
+	t.Cleanup(local.Close)
+
+	client, frames := streamTestClient(t, local.URL)
+	if !client.isStreamMode() {
+		t.Fatal("test client must negotiate protocol 2")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		client.handleRequest(&TunnelRequest{ID: "plain-1", Method: "GET", Path: "/hello"})
+		close(done)
+	}()
+
+	select {
+	case frame := <-frames:
+		resp, ok := frame.(*tunnel.TunnelResponse)
+		if !ok {
+			t.Fatalf("v2 plain request wrote %T, want a legacy TunnelResponse", frame)
+		}
+		if resp.ID != "plain-1" || resp.StatusCode != http.StatusOK {
+			t.Fatalf("legacy response = %+v", resp)
+		}
+		if string(resp.Body) != "hello world" {
+			t.Fatalf("legacy body = %q, want hello world", resp.Body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("v2 plain request produced no frame within 2s")
+	}
+	<-done
+}
+
+// Without a v2 handshake the client keeps the single-frame legacy path.
+func TestHandleRequestLegacySendsSingleFrame(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "hello world")
+	}))
+	t.Cleanup(local.Close)
+
+	client, frames := streamTestClient(t, local.URL)
+	client.streamMode = false
+
+	client.handleRequest(&TunnelRequest{ID: "legacy-1", Method: "GET", Path: "/"})
+
+	resp, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.TunnelResponse)
+	if !ok {
+		t.Fatal("legacy mode must write one TunnelResponse frame")
+	}
+	if resp.ID != "legacy-1" || resp.StatusCode != http.StatusOK {
+		t.Fatalf("legacy response = %+v", resp)
+	}
+	if string(resp.Body) != "hello world" {
+		t.Fatalf("legacy body = %q, want hello world", resp.Body)
+	}
+}
+
+// The handshake response decides the mode: >= 2 streams, missing/1 falls back.
+func TestConnectNegotiatesStreamProtocol(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+		want   bool
+	}{
+		{name: "v2", header: "2", want: true},
+		{name: "v3", header: "3", want: true},
+		{name: "v1", header: "1", want: false},
+		{name: "missing", header: "", want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requestHeader := make(chan string, 1)
+			upgrader := websocket.Upgrader{}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestHeader <- r.Header.Get("X-Tunnel-Protocol")
+				var responseHeader http.Header
+				if tc.header != "" {
+					responseHeader = http.Header{"X-Tunnel-Protocol": []string{tc.header}}
+				}
+				conn, err := upgrader.Upgrade(w, r, responseHeader)
+				if err != nil {
+					return
+				}
+				conn.Close()
+			}))
+			t.Cleanup(srv.Close)
+
+			client := &TunnelClient{
+				config:     &DeviceConfig{RelayURL: srv.URL, Subdomain: "s1"},
+				localPort:  "1",
+				httpClient: &http.Client{Timeout: time.Second},
+			}
+			client.connect()
+
+			if got := <-requestHeader; got != "2" {
+				t.Fatalf("client announced protocol %q, want 2", got)
+			}
+			if client.streamMode != tc.want {
+				t.Fatalf("streamMode = %v, want %v for header %q", client.streamMode, tc.want, tc.header)
+			}
+		})
+	}
+}
+
+type localWSInfo struct {
+	header      http.Header
+	subprotocol string
+}
+
+// wsTestServer is a local echo WebSocket endpoint that reports the handshake it
+// saw and the close code it eventually received.
+func wsTestServer(t *testing.T) (string, <-chan localWSInfo, <-chan int) {
+	t.Helper()
+
+	infoCh := make(chan localWSInfo, 1)
+	closeCh := make(chan int, 1)
+	upgrader := websocket.Upgrader{
+		Subprotocols: []string{"proto.v1"},
+		CheckOrigin:  func(*http.Request) bool { return true },
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		infoCh <- localWSInfo{header: r.Header.Clone(), subprotocol: conn.Subprotocol()}
+		for {
+			opcode, data, err := conn.ReadMessage()
+			if err != nil {
+				code := websocket.CloseAbnormalClosure
+				var closeErr *websocket.CloseError
+				if errors.As(err, &closeErr) {
+					code = closeErr.Code
+				}
+				closeCh <- code
+				return
+			}
+			if err := conn.WriteMessage(opcode, data); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http"), infoCh, closeCh
+}
+
+// ws-open dials the local server, filters relay credentials, negotiates the
+// subprotocol and bridges both directions.
+func TestHandleWsOpenForwardsFramesAndSubprotocol(t *testing.T) {
+	wsURL, infoCh, closeCh := wsTestServer(t)
+
+	client, frames := streamTestClient(t, "http://127.0.0.1:"+portOf(t, wsURL))
+	client.handleWsOpen(&tunnel.WsOpen{
+		ID:   "w1",
+		Path: "/terminal",
+		Headers: map[string]string{
+			"X-Custom":      "yes",
+			"Authorization": "Bearer relay-secret",
+			"Cookie":        "session=relay-secret",
+			"Connection":    "Upgrade",
+		},
+		Subprotocols: []string{"proto.v1"},
+	})
+
+	ack, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsAck)
+	if !ok {
+		t.Fatal("first frame after ws-open must be ws-ack")
+	}
+	if !ack.OK || ack.Status != http.StatusSwitchingProtocols || ack.Subprotocol != "proto.v1" {
+		t.Fatalf("ws-ack = %+v", ack)
+	}
+
+	info := <-infoCh
+	if info.subprotocol != "proto.v1" {
+		t.Fatalf("local subprotocol = %q, want proto.v1", info.subprotocol)
+	}
+	if info.header.Get("X-Custom") != "yes" {
+		t.Fatalf("custom header not forwarded: %v", info.header)
+	}
+	if info.header.Get("Authorization") != "" || info.header.Get("Cookie") != "" {
+		t.Fatalf("relay credentials leaked to local WS: %v", info.header)
+	}
+
+	// relay -> local
+	client.handleWsFrame(&tunnel.WsFrame{ID: "w1", Opcode: websocket.TextMessage, Data: []byte("ping")})
+
+	// local echo -> relay
+	echo, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsFrame)
+	if !ok {
+		t.Fatal("expected ws-frame from the local echo")
+	}
+	if echo.ID != "w1" || echo.Opcode != websocket.TextMessage || string(echo.Data) != "ping" {
+		t.Fatalf("ws-frame = %+v", echo)
+	}
+
+	// relay -> local close propagates the code.
+	client.handleWsClose(&tunnel.WsClose{ID: "w1", Code: websocket.CloseNormalClosure, Reason: "done"})
+	select {
+	case code := <-closeCh:
+		if code != websocket.CloseNormalClosure {
+			t.Fatalf("local close code = %d, want %d", code, websocket.CloseNormalClosure)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("local WS did not observe the relay close")
+	}
+}
+
+func portOf(t *testing.T, rawURL string) string {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse %q: %v", rawURL, err)
+	}
+	return u.Port()
+}
+
+// A local dial failure is reported as ws-ack{ok:false,status:502}.
+func TestHandleWsOpenDialFailureAcks502(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(local.Close)
+
+	client, frames := streamTestClient(t, local.URL)
+	client.handleWsOpen(&tunnel.WsOpen{ID: "w1", Path: "/missing"})
+
+	ack, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsAck)
+	if !ok {
+		t.Fatal("expected ws-ack")
+	}
+	if ack.OK || ack.Status != http.StatusBadGateway || ack.Error == "" {
+		t.Fatalf("ws-ack = %+v, want ok=false status=502 with an error", ack)
+	}
+}
+
+// A duplicate ws-open for an id that is still open must be rejected.
+func TestHandleWsOpenRejectsDuplicate(t *testing.T) {
+	wsURL, _, _ := wsTestServer(t)
+	client, frames := streamTestClient(t, "http://127.0.0.1:"+portOf(t, wsURL))
+
+	client.handleWsOpen(&tunnel.WsOpen{ID: "w1", Path: "/terminal", Subprotocols: []string{"proto.v1"}})
+	if ack, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsAck); !ok || !ack.OK {
+		t.Fatalf("first ws-ack = %+v, ok=%v", ack, ok)
+	}
+
+	client.handleWsOpen(&tunnel.WsOpen{ID: "w1", Path: "/terminal"})
+	ack, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsAck)
+	if !ok {
+		t.Fatal("expected a second ws-ack")
+	}
+	if ack.OK || ack.Status != http.StatusConflict {
+		t.Fatalf("duplicate ws-ack = %+v, want ok=false status=409", ack)
+	}
+}
+
+// A locally-initiated close is reported upstream with its close code.
+func TestLocalWsCloseSendsWsClose(t *testing.T) {
+	wsURL, infoCh, _ := wsTestServer(t)
+	client, frames := streamTestClient(t, "http://127.0.0.1:"+portOf(t, wsURL))
+
+	client.handleWsOpen(&tunnel.WsOpen{ID: "w1", Path: "/terminal", Subprotocols: []string{"proto.v1"}})
+	if ack, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsAck); !ok || !ack.OK {
+		t.Fatalf("ws-ack = %+v, ok=%v", ack, ok)
+	}
+	<-infoCh
+
+	// Reach into the session to close it the way the local endpoint would.
+	client.wsMu.Lock()
+	sess := client.wsConns["w1"]
+	client.wsMu.Unlock()
+	if sess == nil || sess.conn == nil {
+		t.Fatal("local ws session missing")
+	}
+	sess.conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseGoingAway, "shutdown"), time.Now().Add(time.Second))
+
+	closeFrame, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsClose)
+	if !ok {
+		t.Fatal("expected ws-close from the local close")
+	}
+	if closeFrame.ID != "w1" || closeFrame.Code != websocket.CloseGoingAway {
+		t.Fatalf("ws-close = %+v, want id w1 code 1001", closeFrame)
+	}
+}
+
+// req-cancel stops the local request and no further chunks are sent; cancelling
+// twice is a no-op.
+func TestHandleReqCancelStopsStream(t *testing.T) {
+	started := make(chan struct{})
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "first")
+		w.(http.Flusher).Flush()
+		close(started)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(local.Close)
+
+	client, frames := streamTestClient(t, local.URL)
+	go client.handleRequest(sseRequest("s1", "/events"))
+
+	if _, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.ResHead); !ok {
+		t.Fatal("expected res-head")
+	}
+	chunk, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.ResChunk)
+	if !ok || string(chunk.Data) != "first" {
+		t.Fatalf("first chunk = %+v, ok=%v", chunk, ok)
+	}
+	<-started
+
+	client.handleReqCancel(&tunnel.ReqCancel{ID: "s1"})
+	client.handleReqCancel(&tunnel.ReqCancel{ID: "s1"}) // idempotent, must not panic
+
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case frame := <-frames:
+			if c, ok := frame.(*tunnel.ResChunk); ok {
+				t.Fatalf("chunk after cancel: %q", c.Data)
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
+// Oversized response headers must be trimmed with a warning instead of being
+// silently dropped or failing the whole stream.
+func TestSendResHeadTruncatesOversizedHeaders(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Small", "kept")
+		w.Header().Set("X-Huge", strings.Repeat("a", 3<<20))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(local.Close)
+
+	client, frames := streamTestClient(t, local.URL)
+
+	var logged bytes.Buffer
+	oldOutput, oldFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logged)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(oldOutput)
+		log.SetFlags(oldFlags)
+	})
+
+	go client.handleRequest(sseRequest("r1", "/huge-headers"))
+
+	head, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.ResHead)
+	if !ok {
+		t.Fatal("expected res-head")
+	}
+	if head.ID != "r1" || head.StatusCode != http.StatusOK {
+		t.Fatalf("res-head = %+v, want id r1 status 200", head)
+	}
+	if _, present := head.Headers["X-Huge"]; present {
+		t.Fatal("oversized header was not trimmed")
+	}
+	if head.Headers["X-Small"] != "kept" {
+		t.Fatalf("small header lost during trimming: %+v", head.Headers)
+	}
+	if !strings.Contains(logged.String(), "dropped") {
+		t.Fatalf("header trimming was not logged: %q", logged.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Streaming payload encryption (design D8).
+// ---------------------------------------------------------------------------
+
+// testStreamKey is a valid 32-byte AES-256 key in hex.
+const testStreamKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+
+func testBinaryPayload(n int) []byte {
+	body := make([]byte, n)
+	for i := range body {
+		body[i] = byte(i % 256)
+	}
+	// Make sure the edge bytes the encryption layer must not special-case are
+	// present.
+	if n > 2 {
+		body[0] = 0x00
+		body[1] = 0xff
+		body[n-1] = 0x00
+	}
+	return body
+}
+
+// A stream chunk is encrypted on its own and carries the raw
+// nonce||ciphertext||tag layout; the head marks the stream as encrypted.
+func TestHandleRequestStreamEncryptsChunks(t *testing.T) {
+	body := testBinaryPayload(70*1024 + 7)
+
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}))
+	t.Cleanup(local.Close)
+
+	client, frames := streamTestClient(t, local.URL)
+	client.config.EncryptionKey = testStreamKey
+
+	go client.handleRequest(sseRequest("e1", "/encrypted"))
+
+	head, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.ResHead)
+	if !ok {
+		t.Fatal("first frame must be res-head")
+	}
+	if got := head.Headers["X-E2E-Stream"]; got != "1" {
+		t.Fatalf("X-E2E-Stream = %q, want 1", got)
+	}
+
+	var got []byte
+	sawEnd := false
+	for !sawEnd {
+		switch frame := nextFrame(t, frames, 5*time.Second).(type) {
+		case *tunnel.ResChunk:
+			plain, err := decryptSSEChunk(frame.Data, testStreamKey)
+			if err != nil {
+				t.Fatalf("chunk %d did not decrypt: %v", frame.Seq, err)
+			}
+			if want := len(plain) + 4 + 28; len(frame.Data) != want {
+				t.Fatalf("chunk %d ciphertext = %d bytes, want %d (len+nonce+tag)", frame.Seq, len(frame.Data), want)
+			}
+			got = append(got, plain...)
+		case *tunnel.ResEnd:
+			sawEnd = true
+		case *tunnel.ResError:
+			t.Fatalf("unexpected res-error: %s", frame.Message)
+		default:
+			t.Fatalf("unexpected frame %T", frame)
+		}
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("decrypted stream mismatch: got %d bytes, want %d", len(got), len(body))
+	}
+}
+
+// Without a key the stream stays plaintext and says so explicitly.
+func TestHandleRequestStreamWithoutKeyMarksPlaintext(t *testing.T) {
+	body := []byte("data: plain\n\n")
+
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}))
+	t.Cleanup(local.Close)
+
+	client, frames := streamTestClient(t, local.URL)
+	go client.handleRequest(sseRequest("p1", "/events"))
+
+	head, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.ResHead)
+	if !ok {
+		t.Fatal("first frame must be res-head")
+	}
+	if got := head.Headers["X-E2E-Stream"]; got != "0" {
+		t.Fatalf("X-E2E-Stream = %q, want 0", got)
+	}
+
+	chunk, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.ResChunk)
+	if !ok {
+		t.Fatal("expected res-chunk")
+	}
+	if !bytes.Equal(chunk.Data, body) {
+		t.Fatalf("chunk = %q, want plaintext %q", chunk.Data, body)
+	}
+	if _, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.ResEnd); !ok {
+		t.Fatal("expected res-end")
+	}
+}
+
+// Each encryption is independent: fresh nonce, raw layout, and only the right
+// key decrypts.
+func TestStreamPayloadRoundTrip(t *testing.T) {
+	plain := testBinaryPayload(1024)
+
+	first, err := encryptStreamPayload(plain, testStreamKey)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	second, err := encryptStreamPayload(plain, testStreamKey)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if len(first) != len(plain)+28 {
+		t.Fatalf("ciphertext = %d bytes, want %d", len(first), len(plain)+28)
+	}
+	if bytes.Equal(first, second) {
+		t.Fatal("two encryptions produced identical bytes; nonce is not random")
+	}
+
+	got, err := decryptStreamPayload(first, testStreamKey)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("round trip mismatch: got %d bytes, want %d", len(got), len(plain))
+	}
+
+	wrongKey := strings.Repeat("ff", 32)
+	if _, err := decryptStreamPayload(first, wrongKey); err == nil {
+		t.Fatal("decrypt with the wrong key succeeded")
+	}
+}
+
+// SSE chunks carry an explicit plaintext length so the app can decrypt them
+// without relying on HTTP chunk boundaries.
+func TestSSEChunkFraming(t *testing.T) {
+	plain := testBinaryPayload(700)
+
+	framed, err := encryptSSEChunk(plain, testStreamKey)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if len(framed) != 4+len(plain)+28 {
+		t.Fatalf("framed = %d bytes, want %d", len(framed), 4+len(plain)+28)
+	}
+	if got := int(binary.BigEndian.Uint32(framed[:4])); got != len(plain) {
+		t.Fatalf("length prefix = %d, want %d", got, len(plain))
+	}
+
+	back, err := decryptSSEChunk(framed, testStreamKey)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if !bytes.Equal(back, plain) {
+		t.Fatal("round trip mismatch")
+	}
+
+	// A truncated or mis-framed chunk must fail loudly rather than yield
+	// partial plaintext.
+	if _, err := decryptSSEChunk(framed[:3], testStreamKey); err == nil {
+		t.Fatal("short chunk accepted")
+	}
+	bad := append([]byte{}, framed...)
+	binary.BigEndian.PutUint32(bad[:4], uint32(len(plain)+1))
+	if _, err := decryptSSEChunk(bad, testStreamKey); err == nil {
+		t.Fatal("length mismatch accepted")
+	}
+}
+
+// ws-open must report whether the session payloads are encrypted, and the
+// bridge must encrypt both directions with the same key.
+func TestHandleWsOpenEncryptsFrames(t *testing.T) {
+	wsURL, infoCh, closeCh := wsTestServer(t)
+
+	client, frames := streamTestClient(t, "http://127.0.0.1:"+portOf(t, wsURL))
+	client.config.EncryptionKey = testStreamKey
+
+	client.handleWsOpen(&tunnel.WsOpen{ID: "w1", Path: "/terminal", Subprotocols: []string{"proto.v1"}})
+
+	ack, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsAck)
+	if !ok {
+		t.Fatal("first frame after ws-open must be ws-ack")
+	}
+	if !ack.OK || !ack.Encrypted {
+		t.Fatalf("ws-ack = %+v, want ok=true encrypted=true", ack)
+	}
+	<-infoCh
+
+	// relay -> local: the relay frame carries ciphertext.
+	encrypted, err := encryptStreamPayload([]byte("ping"), testStreamKey)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	client.handleWsFrame(&tunnel.WsFrame{ID: "w1", Opcode: websocket.TextMessage, Data: encrypted})
+
+	// local echo -> relay: the client must encrypt what the local socket sent.
+	echo, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsFrame)
+	if !ok {
+		t.Fatal("expected ws-frame from the local echo")
+	}
+	if bytes.Equal(echo.Data, []byte("ping")) {
+		t.Fatal("ws-frame payload was forwarded in plaintext")
+	}
+	plain, err := decryptStreamPayload(echo.Data, testStreamKey)
+	if err != nil {
+		t.Fatalf("forwarded frame did not decrypt: %v", err)
+	}
+	if string(plain) != "ping" {
+		t.Fatalf("forwarded frame = %q, want ping", plain)
+	}
+
+	client.handleWsClose(&tunnel.WsClose{ID: "w1", Code: websocket.CloseNormalClosure, Reason: "done"})
+	select {
+	case <-closeCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("local WS did not observe the relay close")
+	}
+}
+
+// Without a key the ack says plaintext and frames pass through untouched.
+func TestHandleWsOpenWithoutKeyMarksPlaintext(t *testing.T) {
+	wsURL, infoCh, _ := wsTestServer(t)
+
+	client, frames := streamTestClient(t, "http://127.0.0.1:"+portOf(t, wsURL))
+	client.handleWsOpen(&tunnel.WsOpen{ID: "w1", Path: "/terminal", Subprotocols: []string{"proto.v1"}})
+
+	ack, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsAck)
+	if !ok || !ack.OK {
+		t.Fatalf("ws-ack = %+v, ok=%v", ack, ok)
+	}
+	if ack.Encrypted {
+		t.Fatal("ws-ack.Encrypted = true without a key")
+	}
+	<-infoCh
+
+	client.handleWsFrame(&tunnel.WsFrame{ID: "w1", Opcode: websocket.TextMessage, Data: []byte("ping")})
+	echo, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsFrame)
+	if !ok || string(echo.Data) != "ping" {
+		t.Fatalf("ws-frame = %+v, want plaintext ping", echo)
+	}
+}
+
+// A payload that cannot be decrypted must close the session with 1011 instead
+// of writing ciphertext to the local socket.
+func TestWsFrameDecryptFailureCloses1011(t *testing.T) {
+	wsURL, infoCh, closeCh := wsTestServer(t)
+
+	client, frames := streamTestClient(t, "http://127.0.0.1:"+portOf(t, wsURL))
+	client.config.EncryptionKey = "not-a-hex-key"
+
+	client.handleWsOpen(&tunnel.WsOpen{ID: "w1", Path: "/terminal", Subprotocols: []string{"proto.v1"}})
+	if ack, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsAck); !ok || !ack.OK {
+		t.Fatalf("ws-ack = %+v, ok=%v", ack, ok)
+	}
+	<-infoCh
+
+	client.handleWsFrame(&tunnel.WsFrame{ID: "w1", Opcode: websocket.TextMessage, Data: []byte("garbage")})
+
+	closeFrame, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsClose)
+	if !ok {
+		t.Fatal("expected ws-close after a decrypt failure")
+	}
+	if closeFrame.ID != "w1" || closeFrame.Code != websocket.CloseInternalServerErr {
+		t.Fatalf("ws-close = %+v, want id w1 code 1011", closeFrame)
+	}
+	select {
+	case code := <-closeCh:
+		if code != websocket.CloseInternalServerErr {
+			t.Fatalf("local close code = %d, want 1011", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("local WS was not closed after the decrypt failure")
+	}
+}
+
+// A frame the client cannot encrypt must not reach the relay in plaintext; the
+// session closes with 1011.
+func TestWsFrameEncryptFailureCloses1011(t *testing.T) {
+	wsURL, infoCh, closeCh := wsTestServer(t)
+
+	client, frames := streamTestClient(t, "http://127.0.0.1:"+portOf(t, wsURL))
+	client.config.EncryptionKey = "not-a-hex-key"
+
+	client.handleWsOpen(&tunnel.WsOpen{ID: "w1", Path: "/terminal", Subprotocols: []string{"proto.v1"}})
+	if ack, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsAck); !ok || !ack.OK {
+		t.Fatalf("ws-ack = %+v, ok=%v", ack, ok)
+	}
+	<-infoCh
+
+	client.wsMu.Lock()
+	sess := client.wsConns["w1"]
+	client.wsMu.Unlock()
+	if sess == nil || sess.conn == nil {
+		t.Fatal("local ws session missing")
+	}
+	if err := sess.conn.WriteMessage(websocket.TextMessage, []byte("outbound")); err != nil {
+		t.Fatalf("local write: %v", err)
+	}
+
+	closeFrame, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsClose)
+	if !ok {
+		t.Fatal("expected ws-close after an encrypt failure")
+	}
+	if closeFrame.Code != websocket.CloseInternalServerErr {
+		t.Fatalf("ws-close = %+v, want code 1011", closeFrame)
+	}
+	select {
+	case code := <-closeCh:
+		if code != websocket.CloseInternalServerErr {
+			t.Fatalf("local close code = %d, want 1011", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("local WS was not closed after the encrypt failure")
 	}
 }

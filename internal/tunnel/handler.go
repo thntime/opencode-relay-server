@@ -161,25 +161,7 @@ func forwardHTTP(w http.ResponseWriter, r *http.Request, manager *Manager, hostI
 		return
 	}
 
-	headers := make(map[string]string)
-	for key := range r.Header {
-		if isHopByHopHeader(key) || isRelayCredentialHeader(key) {
-			continue
-		}
-		headers[key] = r.Header.Get(key)
-	}
-
-	if r.URL.RawQuery != "" {
-		targetPath = targetPath + "?" + r.URL.RawQuery
-	}
-
-	tunnelReq := &TunnelRequest{
-		ID:      GenerateRequestID(),
-		Method:  r.Method,
-		Path:    targetPath,
-		Headers: headers,
-		Body:    body,
-	}
+	tunnelReq := buildTunnelRequest(r, targetPath, body)
 
 	log.Printf("[forward] Forwarding request ID=%s to tunnel", tunnelReq.ID)
 
@@ -213,6 +195,31 @@ func forwardHTTP(w http.ResponseWriter, r *http.Request, manager *Manager, hostI
 	}
 
 	log.Printf("[forward] Request completed successfully")
+}
+
+// buildTunnelRequest snapshots r into a tunnel request. Relay credentials and
+// client-session headers are never forwarded to the host's local OpenCode
+// server.
+func buildTunnelRequest(r *http.Request, targetPath string, body []byte) *TunnelRequest {
+	headers := make(map[string]string)
+	for key := range r.Header {
+		if isHopByHopHeader(key) || isRelayCredentialHeader(key) {
+			continue
+		}
+		headers[key] = r.Header.Get(key)
+	}
+
+	if r.URL.RawQuery != "" {
+		targetPath = targetPath + "?" + r.URL.RawQuery
+	}
+
+	return &TunnelRequest{
+		ID:      GenerateRequestID(),
+		Method:  r.Method,
+		Path:    targetPath,
+		Headers: headers,
+		Body:    body,
+	}
 }
 
 var hopByHopHeaders = map[string]bool{

@@ -197,6 +197,16 @@ fly secrets set JWT_SECRET=your-secret
 fly deploy
 ```
 
+### Deploying behind nginx
+
+`deploy/nginx-relay.conf` is the reverse-proxy config for the `/relay/` route, including the
+streaming and WebSocket settings (HTTP/1.1 upstream, `Upgrade`/`Connection`, buffering off,
+long timeouts). The `map $http_upgrade $connection_upgrade` block must be placed in the
+`http` block, not inside `server`.
+
+These snippets have **not** been validated on a machine with nginx; run `nginx -t` on the
+target host before reloading. Nothing here has been tested end-to-end against a live relay.
+
 ### Update Tunnel Client
 
 After self-hosting, update the default relay URL:
@@ -268,8 +278,80 @@ server receives requests carrying no credentials whatsoever. A valid relay JWT i
 full access to every host of its user. JWTs are valid for 30 days and there is no revocation mechanism: if
 one leaks, rotating `JWT_SECRET` is the only remediation.
 
-Streaming responses (SSE) and WebSocket forwarding (terminal PTY) are not implemented yet; the tunnel
-protocol is request/response only, so SSE clients fall back to polling until that work lands.
+Streaming responses (SSE) and WebSocket forwarding are covered in
+[Streaming and WebSocket](#streaming-and-websocket); plain request/response traffic keeps
+working unchanged for clients that do not negotiate protocol v2.
+
+### Streaming and WebSocket
+
+Protocol v2 adds incremental response streaming (SSE) and WebSocket forwarding (tunneled
+terminal PTY) on top of the existing request/response frames. Both ride the same tunnel
+WebSocket, so no new endpoint or port is needed.
+
+#### Frames
+
+| Frame | Direction | Purpose |
+|-------|-----------|---------|
+| `res-head` | client → relay | Status code and headers of the upstream response; sent once, before any chunk. |
+| `res-chunk` | client → relay | One response body chunk (`seq` + base64 `data`), delivered in order. |
+| `res-end` | client → relay | Clean end of the response stream. |
+| `res-error` | client → relay | Abort the stream; carries a human-readable `message`. |
+| `req-cancel` | relay → client | The consumer went away; the client cancels the local request. |
+| `ws-open` | relay → client | Ask the client to dial `ws://127.0.0.1:<port><path>`, forwarding the original headers and subprotocols. |
+| `ws-ack` | client → relay | Dial result: `ok`, `status`, `error`, `subprotocol`. |
+| `ws-frame` | both | One WebSocket message (opcode + base64 `data`), relayed in both directions. |
+| `ws-close` | both | Close the WebSocket; carries the `code` and `reason` through unchanged. |
+
+#### Capability negotiation
+
+The client sends `X-Tunnel-Protocol: 2` in the tunnel handshake request; the relay echoes the
+same version in the **handshake response** header. If the header is missing on the response,
+the client stays on v1 (whole-payload `io.ReadAll`) — that is also how it detects a
+downgraded relay. A relay that receives a streaming request (`Accept: text/event-stream` or
+`Upgrade: websocket`) on a v1 connection answers **501** with a hint to upgrade the client.
+
+#### Limits
+
+| Limit | Value | On exceed |
+|-------|-------|-----------|
+| Single frame | 1 MiB (before base64) | 413, or WebSocket close code 1009 |
+| Concurrent streams per connection | 16 | 429, or WebSocket close code 1011 |
+| Per-stream send buffer | 32 frames or 4 MiB | Stream is closed and the host is told to stop |
+| Slow consumer | 30s without write progress | Stream is closed |
+
+These are compile-time constants for now; they become configurable once there is real
+pressure data.
+
+#### HTTP/1.1 requirement
+
+WebSocket forwarding is implemented with `http.Hijacker`, which HTTP/2 cannot provide. The
+relay therefore requires HTTP/1.1 and answers **426** when `ProtoMajor != 1`. Terminate TLS
+at a reverse proxy that speaks HTTP/1.1 to the relay (see [Deploying behind nginx](#deploying-behind-nginx));
+`listen ... http2` on the nginx side is fine for that hop, because nginx re-originates the
+upstream request as HTTP/1.1. Note that nginx itself cannot upgrade a WebSocket that arrived
+over HTTP/2, so the phone must use HTTP/1.1 for WebSocket requests.
+
+#### End-to-end encryption
+
+When the host has reported a host key, `res-chunk` and `ws-frame` payloads are encrypted
+frame by frame with AES-256-GCM. `res-head` carries `X-E2E-Stream: 1` and `ws-ack` reports
+`encrypted=true` so the phone knows to decrypt each frame. Without a key the stream is
+plaintext, exactly like v1 payloads. The relay never decrypts either way; it only routes
+frames by `id`.
+
+#### Rollback
+
+Rolling the relay back to a v1 build is safe: the client finds no `X-Tunnel-Protocol` in the
+handshake response and automatically falls back to `handleRequestLegacy` (whole-payload).
+WebSocket and streaming requests get 501/426, ordinary requests are unaffected. No data
+migration is involved.
+
+#### nginx
+
+`proxy_buffering off` and the long `proxy_read_timeout`/`proxy_send_timeout` are required.
+With buffering on, nginx holds SSE events until the response ends and the event stream
+appears stuck; with the old 130s timeout, any stream or terminal session idle for longer is
+truncated. See `deploy/nginx-relay.conf`.
 
 ### Migrating from `/proxy/`
 

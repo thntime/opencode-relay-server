@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -24,15 +25,19 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/gorilla/websocket"
 	"github.com/skip2/go-qrcode"
+	"github.com/zero469/opencode-relay-server/internal/tunnel"
 	"golang.org/x/crypto/scrypt"
 	"golang.org/x/term"
 )
@@ -54,6 +59,18 @@ const (
 
 	keyKdfScrypt      = "scrypt-n15-r8-p1"
 	keyReportAttempts = 3
+
+	// tunnelProtocolVersion is the streaming protocol the client announces in
+	// the upgrade request. Relay answers with X-Tunnel-Protocol on the
+	// handshake response; anything >= this enables streaming.
+	tunnelProtocolVersion = 2
+	// streamChunkSize is the maximum body slice carried by one res-chunk.
+	// Encrypting adds 28 bytes (12-byte nonce + 16-byte tag), which stays well
+	// inside MaxFrameBytes.
+	streamChunkSize = 32 * 1024
+	// streamE2EHeader marks whether streaming payloads are E2E encrypted:
+	// "1" when EncryptionKey is set, "0" for plaintext.
+	streamE2EHeader = "X-E2E-Stream"
 )
 
 // keyReportRetryDelay is a var so tests can skip the backoff waits.
@@ -160,6 +177,38 @@ type TunnelClient struct {
 	// teardown and an external Stop() cannot close it twice.
 	sseStopMu  sync.Mutex
 	sseStopped bool
+
+	// streamMode is re-negotiated on every connect(). When false the client
+	// uses the legacy single-frame response path. modeMu keeps handlers of a
+	// dying connection from racing with the next negotiation.
+	modeMu     sync.RWMutex
+	streamMode bool
+
+	// streamCancels maps an in-flight request ID to its cancel handle so
+	// req-cancel and connection teardown can abort the local request.
+	streamsMu     sync.Mutex
+	streamCancels map[string]*streamCancel
+
+	// wsConns holds local WebSocket sessions by tunnel request ID.
+	wsMu    sync.Mutex
+	wsConns map[string]*wsSession
+}
+
+// streamCancel is an identity token so a replaced stream cannot unregister the
+// cancel handle of a newer stream that reused the same ID.
+type streamCancel struct {
+	cancel context.CancelFunc
+}
+
+// wsSession is one local WebSocket bridged to the relay. conn is nil while the
+// dial is still in flight; writeMu serialises writes to the local socket.
+// encrypted mirrors WsAck.Encrypted for this session so both directions agree
+// even if the device config changes later.
+type wsSession struct {
+	conn      *websocket.Conn
+	writeMu   sync.Mutex
+	once      sync.Once
+	encrypted bool
 }
 
 // sseReconnectDelay is how long subscribeSSE waits before resubscribing after a
@@ -1648,7 +1697,13 @@ func (c *TunnelClient) connect() error {
 			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(resolvedIP, port))
 		},
 	}
-	conn, resp, err := wsDial(&dialer, wsURL, nil)
+	// Announce the streaming protocol in the upgrade request. Old relays ignore
+	// unknown headers and simply omit the response header, which keeps this
+	// client on the legacy path.
+	handshakeHeader := http.Header{}
+	handshakeHeader.Set("X-Tunnel-Protocol", strconv.Itoa(tunnelProtocolVersion))
+
+	conn, resp, err := wsDial(&dialer, wsURL, handshakeHeader)
 	if err != nil {
 		if resp != nil {
 			// The caller owns the response body when the handshake fails. Drain
@@ -1663,6 +1718,17 @@ func (c *TunnelClient) connect() error {
 	}
 	c.conn = conn
 	defer conn.Close()
+
+	// Re-negotiate on every connection: a relay downgrade or rollback must put
+	// this client back on the legacy path.
+	streaming := false
+	if resp != nil {
+		if version, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("X-Tunnel-Protocol"))); err == nil && version >= tunnelProtocolVersion {
+			streaming = true
+		}
+	}
+	c.setStreamMode(streaming)
+	log.Printf("Tunnel protocol negotiated: streaming=%v", streaming)
 
 	fmt.Printf("✓ Connected! Tunneling to localhost:%s\n", c.localPort)
 
@@ -1679,6 +1745,10 @@ func (c *TunnelClient) connect() error {
 		close(done)
 		c.stopSSE()
 		c.sseWaitGroup.Wait()
+		// Streams and local WebSockets belong to this connection: a reconnect
+		// must not leave them attached to a dead tunnel.
+		c.cancelAllStreams()
+		c.closeAllWs()
 	}()
 
 	go func() {
@@ -1735,12 +1805,58 @@ func (c *TunnelClient) connect() error {
 		}
 
 		var req TunnelRequest
-		if err := json.Unmarshal(message, &req); err != nil {
-			continue
+		switch frameTypeOf(message) {
+		case tunnel.FrameWsOpen:
+			var open tunnel.WsOpen
+			if err := json.Unmarshal(message, &open); err != nil {
+				debugLog("[ws] failed to decode ws-open: %v", err)
+				continue
+			}
+			go c.handleWsOpen(&open)
+		case tunnel.FrameWsFrame:
+			var frame tunnel.WsFrame
+			if err := json.Unmarshal(message, &frame); err != nil {
+				debugLog("[ws] failed to decode ws-frame: %v", err)
+				continue
+			}
+			c.handleWsFrame(&frame)
+		case tunnel.FrameWsClose:
+			var frame tunnel.WsClose
+			if err := json.Unmarshal(message, &frame); err != nil {
+				debugLog("[ws] failed to decode ws-close: %v", err)
+				continue
+			}
+			c.handleWsClose(&frame)
+		case tunnel.FrameReqCancel:
+			var frame tunnel.ReqCancel
+			if err := json.Unmarshal(message, &frame); err != nil {
+				debugLog("[stream] failed to decode req-cancel: %v", err)
+				continue
+			}
+			c.handleReqCancel(&frame)
+		case "":
+			if err := json.Unmarshal(message, &req); err != nil {
+				continue
+			}
+			go c.handleRequest(&req)
+		default:
+			// Unknown frames are ignored so a newer relay can add types without
+			// breaking this client (design D1).
+			debugLog("[tunnel] ignoring unknown frame type %q", frameTypeOf(message))
 		}
-
-		go c.handleRequest(&req)
 	}
+}
+
+// frameTypeOf reads only the type discriminator of a tunnel frame. An empty
+// type means a legacy frame.
+func frameTypeOf(message []byte) string {
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(message, &probe); err != nil {
+		return ""
+	}
+	return probe.Type
 }
 
 func (c *TunnelClient) buildWebSocketURL() string {
@@ -2003,26 +2119,76 @@ func (c *TunnelClient) handleRequest(req *TunnelRequest) {
 		return
 	}
 
+	if c.isStreamMode() && requestAcceptsEventStream(req) {
+		c.handleRequestStream(req)
+		return
+	}
+	c.handleRequestLegacy(req)
+}
+
+// requestAcceptsEventStream reports whether the forwarded request asked for
+// SSE. The relay only relays text/event-stream requests incrementally; every
+// other request still uses the single legacy response frame, even on a v2
+// tunnel.
+func requestAcceptsEventStream(req *TunnelRequest) bool {
+	for key, value := range req.Headers {
+		if !strings.EqualFold(key, "Accept") {
+			continue
+		}
+		for _, part := range strings.Split(value, ",") {
+			mediaType := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+			if strings.EqualFold(mediaType, "text/event-stream") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (c *TunnelClient) setStreamMode(enabled bool) {
+	c.modeMu.Lock()
+	c.streamMode = enabled
+	c.modeMu.Unlock()
+}
+
+func (c *TunnelClient) isStreamMode() bool {
+	c.modeMu.RLock()
+	defer c.modeMu.RUnlock()
+	return c.streamMode
+}
+
+// newLocalRequest snapshots a tunnel request into a request against the local
+// OpenCode server. On failure it returns the status code and message to report.
+func (c *TunnelClient) newLocalRequest(req *TunnelRequest) (*http.Request, int, string) {
 	localURL := fmt.Sprintf("http://127.0.0.1:%s%s", c.localPort, req.Path)
 
 	requestBody := req.Body
 	if c.config.EncryptionKey != "" && len(req.Body) > 0 {
 		decrypted, err := decrypt(req.Body, c.config.EncryptionKey)
 		if err != nil {
-			c.sendErrorResponse(req.ID, 400, "failed to decrypt request")
-			return
+			return nil, 400, "failed to decrypt request"
 		}
 		requestBody = decrypted
 	}
 
 	httpReq, err := http.NewRequest(req.Method, localURL, bytes.NewReader(requestBody))
 	if err != nil {
-		c.sendErrorResponse(req.ID, 500, "failed to create request")
-		return
+		return nil, 500, "failed to create request"
 	}
 
 	for key, value := range req.Headers {
 		httpReq.Header.Set(key, value)
+	}
+	return httpReq, 0, ""
+}
+
+// handleRequestLegacy buffers the whole local response into a single
+// TunnelResponse frame. It is used with relays that do not speak protocol v2.
+func (c *TunnelClient) handleRequestLegacy(req *TunnelRequest) {
+	httpReq, status, message := c.newLocalRequest(req)
+	if httpReq == nil {
+		c.sendErrorResponse(req.ID, status, message)
+		return
 	}
 
 	resp, err := c.httpClient.Do(httpReq)
@@ -2084,6 +2250,526 @@ func (c *TunnelClient) handleRequest(req *TunnelRequest) {
 	} else {
 		debugLog("[debug] Sent response: status=%d, bodyLen=%d", resp.StatusCode, len(responseBody))
 	}
+}
+
+// handleRequestStream forwards the local response as res-head, res-chunk...,
+// res-end without buffering the body. Each request gets its own context so a
+// req-cancel or a dropped tunnel stops the local handler promptly.
+func (c *TunnelClient) handleRequestStream(req *TunnelRequest) {
+	httpReq, _, message := c.newLocalRequest(req)
+	if httpReq == nil {
+		c.sendFrame(&tunnel.ResError{ID: req.ID, Message: message})
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	handle := c.registerStreamCancel(req.ID, cancel)
+	defer func() {
+		c.unregisterStreamCancel(req.ID, handle)
+		cancel()
+	}()
+
+	resp, err := c.httpClient.Do(httpReq.WithContext(ctx))
+	if err != nil {
+		if ctx.Err() == nil {
+			c.sendFrame(&tunnel.ResError{ID: req.ID, Message: "local service unavailable: " + err.Error()})
+		}
+		return
+	}
+	defer resp.Body.Close()
+
+	// Streaming frames each carry their own payload: when an E2E key exists the
+	// payloads are encrypted per chunk and the head marks that fact. The relay
+	// only moves bytes and never needs the key (design D8). Content-Length is
+	// dropped because the relay writes the body incrementally.
+	headers := make(map[string]string, len(resp.Header))
+	for key := range resp.Header {
+		if isHopByHopHeader(key) || strings.EqualFold(key, "Content-Length") {
+			continue
+		}
+		headers[key] = resp.Header.Get(key)
+	}
+
+	if err := c.sendResHead(req.ID, resp.StatusCode, headers); err != nil {
+		debugLog("[stream] failed to send res-head for %s: %v", req.ID, err)
+		return
+	}
+
+	keyHex := c.streamEncryptionKey()
+	buf := make([]byte, streamChunkSize)
+	var seq int64
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if ctx.Err() != nil {
+				return
+			}
+			// The relay keeps the chunk until it is written, so hand it a copy
+			// instead of reusing buf.
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			if keyHex != "" {
+				encrypted, err := encryptSSEChunk(data, keyHex)
+				if err != nil {
+					log.Printf("[stream] failed to encrypt chunk %d for %s: %v", seq, req.ID, err)
+					c.sendFrame(&tunnel.ResError{ID: req.ID, Message: "failed to encrypt response"})
+					return
+				}
+				data = encrypted
+			}
+			if err := c.sendFrame(&tunnel.ResChunk{ID: req.ID, Seq: seq, Data: data}); err != nil {
+				debugLog("[stream] failed to send chunk %d for %s: %v", seq, req.ID, err)
+				return
+			}
+			seq++
+		}
+
+		if readErr != nil {
+			switch {
+			case readErr == io.EOF:
+				if err := c.sendFrame(&tunnel.ResEnd{ID: req.ID}); err != nil {
+					debugLog("[stream] failed to send res-end for %s: %v", req.ID, err)
+				}
+			case ctx.Err() != nil:
+				// Cancelled by the relay or by connection teardown: the stream
+				// is already gone, so do not report an error.
+			default:
+				c.sendFrame(&tunnel.ResError{ID: req.ID, Message: "failed to read response: " + readErr.Error()})
+			}
+			return
+		}
+
+		if ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+// sendResHead encodes and writes a res-head, trimming headers if the encoded
+// frame would exceed MaxFrameBytes. Dropping is logged, never silent. It always
+// records whether stream payloads are encrypted so the mobile client does not
+// have to guess.
+func (c *TunnelClient) sendResHead(id string, statusCode int, headers map[string]string) error {
+	if headers == nil {
+		headers = make(map[string]string)
+	}
+	if c.streamEncryptionEnabled() {
+		headers[streamE2EHeader] = "1"
+	} else {
+		headers[streamE2EHeader] = "0"
+	}
+	head := &tunnel.ResHead{ID: id, StatusCode: statusCode, Headers: headers}
+	data, err := tunnel.EncodeFrame(head)
+	if err == nil {
+		return c.writeFrameBytes(data)
+	}
+	if !errors.Is(err, tunnel.ErrFrameTooLarge) {
+		return err
+	}
+
+	keys := make([]string, 0, len(headers))
+	for key := range headers {
+		keys = append(keys, key)
+	}
+	// Drop the largest values first: one huge header should not cost the rest
+	// of the response metadata.
+	sort.Slice(keys, func(i, j int) bool {
+		if len(headers[keys[i]]) != len(headers[keys[j]]) {
+			return len(headers[keys[i]]) > len(headers[keys[j]])
+		}
+		return keys[i] < keys[j]
+	})
+
+	trimmed := make(map[string]string, len(headers))
+	for key, value := range headers {
+		trimmed[key] = value
+	}
+	dropped := 0
+	for len(keys) > 0 {
+		largest := keys[0]
+		keys = keys[1:]
+		delete(trimmed, largest)
+		dropped++
+
+		head.Headers = trimmed
+		data, err = tunnel.EncodeFrame(head)
+		if err == nil {
+			log.Printf("[stream] res-head for %s exceeded MaxFrameBytes; dropped %d header(s)", id, dropped)
+			return c.writeFrameBytes(data)
+		}
+		if !errors.Is(err, tunnel.ErrFrameTooLarge) {
+			return err
+		}
+	}
+
+	head.Headers = nil
+	data, err = tunnel.EncodeFrame(head)
+	if err != nil {
+		return err
+	}
+	log.Printf("[stream] res-head for %s exceeded MaxFrameBytes even without headers; dropped all %d header(s)", id, dropped)
+	return c.writeFrameBytes(data)
+}
+
+// sendFrame encodes a typed protocol frame and writes it to the tunnel.
+func (c *TunnelClient) sendFrame(frame any) error {
+	data, err := tunnel.EncodeFrame(frame)
+	if err != nil {
+		return err
+	}
+	return c.writeFrameBytes(data)
+}
+
+func (c *TunnelClient) writeFrameBytes(data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.conn == nil {
+		return errors.New("tunnel not connected")
+	}
+	c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	return c.conn.WriteMessage(websocket.TextMessage, data)
+}
+
+func (c *TunnelClient) registerStreamCancel(id string, cancel context.CancelFunc) *streamCancel {
+	handle := &streamCancel{cancel: cancel}
+
+	c.streamsMu.Lock()
+	if c.streamCancels == nil {
+		c.streamCancels = make(map[string]*streamCancel)
+	}
+	prev := c.streamCancels[id]
+	c.streamCancels[id] = handle
+	c.streamsMu.Unlock()
+
+	if prev != nil {
+		prev.cancel()
+	}
+	return handle
+}
+
+func (c *TunnelClient) unregisterStreamCancel(id string, handle *streamCancel) {
+	c.streamsMu.Lock()
+	if c.streamCancels[id] == handle {
+		delete(c.streamCancels, id)
+	}
+	c.streamsMu.Unlock()
+}
+
+func (c *TunnelClient) handleReqCancel(frame *tunnel.ReqCancel) {
+	c.streamsMu.Lock()
+	handle := c.streamCancels[frame.ID]
+	delete(c.streamCancels, frame.ID)
+	c.streamsMu.Unlock()
+
+	if handle != nil {
+		handle.cancel()
+	}
+	// The same ID may also name a local WebSocket. Cancelling an unknown ID is
+	// a no-op, so repeated cancels are safe.
+	c.closeWsSession(frame.ID, websocket.CloseNormalClosure, "request cancelled", false)
+}
+
+func (c *TunnelClient) cancelAllStreams() {
+	c.streamsMu.Lock()
+	handles := c.streamCancels
+	c.streamCancels = make(map[string]*streamCancel)
+	c.streamsMu.Unlock()
+
+	for _, handle := range handles {
+		handle.cancel()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Local WebSocket bridging (design D4/D5).
+// ---------------------------------------------------------------------------
+
+// isHopByHopHeader reports connection-scoped headers that must not be copied to
+// the local WebSocket handshake; the dialer generates its own.
+func isHopByHopHeader(header string) bool {
+	switch strings.ToLower(header) {
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+		"te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	}
+	return false
+}
+
+// isBlockedLocalHeader reports relay credentials and handshake headers that
+// must not reach the local endpoint. This mirrors the relay-side rule in
+// internal/tunnel/handler.go.
+func isBlockedLocalHeader(header string) bool {
+	lower := strings.ToLower(header)
+	switch lower {
+	case "authorization", "cookie", "x-real-ip",
+		"sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
+		"sec-websocket-protocol", "sec-websocket-accept", "host":
+		return true
+	}
+	return strings.HasPrefix(lower, "x-forwarded-")
+}
+
+// handleWsOpen dials the local endpoint and bridges it to the relay. The
+// session is reserved before dialing so a duplicate ws-open is rejected even
+// while the first dial is still in flight.
+func (c *TunnelClient) handleWsOpen(open *tunnel.WsOpen) {
+	if open == nil || open.ID == "" {
+		return
+	}
+	encrypted := c.streamEncryptionEnabled()
+
+	c.wsMu.Lock()
+	if c.wsConns == nil {
+		c.wsConns = make(map[string]*wsSession)
+	}
+	if _, exists := c.wsConns[open.ID]; exists {
+		c.wsMu.Unlock()
+		c.sendFrame(&tunnel.WsAck{
+			ID:        open.ID,
+			Status:    http.StatusConflict,
+			Error:     "websocket already open",
+			Encrypted: encrypted,
+		})
+		return
+	}
+	sess := &wsSession{encrypted: encrypted}
+	c.wsConns[open.ID] = sess
+	c.wsMu.Unlock()
+
+	path := open.Path
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	target := fmt.Sprintf("ws://127.0.0.1:%s%s", c.localPort, path)
+
+	header := http.Header{}
+	for key, value := range open.Headers {
+		if isHopByHopHeader(key) || isBlockedLocalHeader(key) {
+			continue
+		}
+		header.Set(key, value)
+	}
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout:  10 * time.Second,
+		EnableCompression: false,
+		Subprotocols:      open.Subprotocols,
+	}
+	conn, resp, err := dialer.Dial(target, header)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+		}
+		c.dropWsSession(open.ID, sess)
+		message := err.Error()
+		if resp != nil {
+			message = fmt.Sprintf("local websocket returned status %d", resp.StatusCode)
+		}
+		debugLog("[ws] dial %s failed: %v", path, err)
+		c.sendFrame(&tunnel.WsAck{
+			ID:        open.ID,
+			Status:    http.StatusBadGateway,
+			Error:     message,
+			Encrypted: encrypted,
+		})
+		return
+	}
+
+	c.wsMu.Lock()
+	if c.wsConns[open.ID] != sess {
+		// The tunnel went away while dialing.
+		c.wsMu.Unlock()
+		conn.Close()
+		return
+	}
+	sess.conn = conn
+	c.wsMu.Unlock()
+
+	if err := c.sendFrame(&tunnel.WsAck{
+		ID:          open.ID,
+		OK:          true,
+		Status:      http.StatusSwitchingProtocols,
+		Subprotocol: conn.Subprotocol(),
+		Encrypted:   encrypted,
+	}); err != nil {
+		c.closeWsSession(open.ID, websocket.CloseGoingAway, "tunnel write failed", false)
+		return
+	}
+
+	go c.pumpLocalWs(open.ID, sess)
+}
+
+// pumpLocalWs forwards local frames to the relay until the socket closes. When
+// the session is encrypted every data frame is sealed on its own; a sealing
+// failure ends the session instead of leaking plaintext.
+func (c *TunnelClient) pumpLocalWs(id string, sess *wsSession) {
+	for {
+		opcode, data, err := sess.conn.ReadMessage()
+		if err != nil {
+			code := websocket.CloseInternalServerErr
+			reason := err.Error()
+			var closeErr *websocket.CloseError
+			if errors.As(err, &closeErr) {
+				code = closeErr.Code
+				reason = closeErr.Text
+				if code == websocket.CloseAbnormalClosure || code == websocket.CloseNoStatusReceived {
+					code = websocket.CloseInternalServerErr
+				}
+			}
+			c.closeWsSession(id, code, reason, true)
+			return
+		}
+
+		if sess.encrypted {
+			encrypted, encErr := encryptStreamPayload(data, c.streamEncryptionKey())
+			if encErr != nil {
+				log.Printf("[ws] failed to encrypt frame for %s: %v", id, encErr)
+				c.closeWsSession(id, websocket.CloseInternalServerErr, "failed to encrypt frame", true)
+				return
+			}
+			data = encrypted
+		}
+
+		if err := c.sendFrame(&tunnel.WsFrame{ID: id, Opcode: opcode, Data: data}); err != nil {
+			debugLog("[ws] failed to forward frame for %s: %v", id, err)
+			c.closeWsSession(id, websocket.CloseInternalServerErr, "tunnel write failed", false)
+			return
+		}
+	}
+}
+
+// handleWsFrame writes one relay frame to the matching local socket. Encrypted
+// sessions must decrypt successfully: a failure closes the socket with 1011 and
+// never writes ciphertext to the local endpoint.
+func (c *TunnelClient) handleWsFrame(frame *tunnel.WsFrame) {
+	if frame == nil {
+		return
+	}
+	c.wsMu.Lock()
+	sess := c.wsConns[frame.ID]
+	c.wsMu.Unlock()
+	if sess == nil {
+		debugLog("[ws] dropping frame for unknown session %s", frame.ID)
+		return
+	}
+	if frame.Opcode != websocket.TextMessage && frame.Opcode != websocket.BinaryMessage {
+		debugLog("[ws] ignoring control opcode %d for %s", frame.Opcode, frame.ID)
+		return
+	}
+
+	data := frame.Data
+	if sess.encrypted {
+		plain, err := decryptStreamPayload(frame.Data, c.streamEncryptionKey())
+		if err != nil {
+			log.Printf("[ws] failed to decrypt frame for %s: %v", frame.ID, err)
+			c.closeWsSession(frame.ID, websocket.CloseInternalServerErr, "failed to decrypt frame", true)
+			return
+		}
+		data = plain
+	}
+
+	sess.writeMu.Lock()
+	var err error
+	if sess.conn != nil {
+		sess.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		err = sess.conn.WriteMessage(frame.Opcode, data)
+	}
+	sess.writeMu.Unlock()
+
+	if err != nil {
+		debugLog("[ws] failed to write to local socket %s: %v", frame.ID, err)
+		c.closeWsSession(frame.ID, websocket.CloseInternalServerErr, "local write failed", true)
+	}
+}
+
+// handleWsClose closes the local socket with the relay's code. The local read
+// loop then sees the close and does not echo a duplicate ws-close back.
+func (c *TunnelClient) handleWsClose(frame *tunnel.WsClose) {
+	if frame == nil {
+		return
+	}
+	code := frame.Code
+	if code == 0 {
+		code = websocket.CloseNormalClosure
+	}
+	// 1005/1006/1015 are local-only statuses and cannot be put on the wire.
+	switch code {
+	case websocket.CloseNoStatusReceived, websocket.CloseAbnormalClosure, websocket.CloseTLSHandshake:
+		code = websocket.CloseInternalServerErr
+	}
+	c.closeWsSession(frame.ID, code, frame.Reason, false)
+}
+
+// closeWsSession removes the session and closes the local socket exactly once.
+// notifyRelay reports the close upstream for locally-initiated closes.
+func (c *TunnelClient) closeWsSession(id string, code int, reason string, notifyRelay bool) {
+	c.wsMu.Lock()
+	sess := c.wsConns[id]
+	if sess != nil {
+		delete(c.wsConns, id)
+	}
+	c.wsMu.Unlock()
+	if sess == nil {
+		return
+	}
+
+	sess.once.Do(func() {
+		sess.writeMu.Lock()
+		if sess.conn != nil {
+			sess.conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(code, truncateCloseReason(reason)),
+				time.Now().Add(time.Second),
+			)
+			sess.conn.Close()
+		}
+		sess.writeMu.Unlock()
+
+		if notifyRelay {
+			c.sendFrame(&tunnel.WsClose{ID: id, Code: code, Reason: truncateCloseReason(reason)})
+		}
+	})
+}
+
+// dropWsSession removes a reservation whose dial failed, without touching a
+// connection that another path may have installed.
+func (c *TunnelClient) dropWsSession(id string, sess *wsSession) {
+	c.wsMu.Lock()
+	if c.wsConns[id] == sess {
+		delete(c.wsConns, id)
+	}
+	c.wsMu.Unlock()
+}
+
+// closeAllWs closes every local socket, e.g. when the tunnel disconnects.
+func (c *TunnelClient) closeAllWs() {
+	c.wsMu.Lock()
+	ids := make([]string, 0, len(c.wsConns))
+	for id := range c.wsConns {
+		ids = append(ids, id)
+	}
+	c.wsMu.Unlock()
+
+	for _, id := range ids {
+		c.closeWsSession(id, websocket.CloseGoingAway, "tunnel disconnected", false)
+	}
+}
+
+// truncateCloseReason keeps a close reason inside the 123-byte protocol limit.
+func truncateCloseReason(reason string) string {
+	const maxCloseReason = 123
+	if len(reason) <= maxCloseReason {
+		return reason
+	}
+	cut := maxCloseReason
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut]
 }
 
 func (c *TunnelClient) sendErrorResponse(reqID string, statusCode int, message string) {
@@ -2658,6 +3344,100 @@ func generateEncryptionKey() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(key), nil
+}
+
+// streamEncryptionKey returns the E2E key used for streaming payloads, or ""
+// when the host has no key.
+func (c *TunnelClient) streamEncryptionKey() string {
+	if c.config == nil {
+		return ""
+	}
+	return c.config.EncryptionKey
+}
+
+// streamEncryptionEnabled reports whether streaming payloads must be sealed.
+func (c *TunnelClient) streamEncryptionEnabled() bool {
+	return c.streamEncryptionKey() != ""
+}
+
+// newGCM builds the AES-256-GCM AEAD for a hex key.
+func newGCM(keyHex string) (cipher.AEAD, error) {
+	key, err := hex.DecodeString(keyHex)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+// encryptStreamPayload seals one streaming payload as raw
+// nonce(12)||ciphertext||tag(16) bytes. Unlike encrypt, it does not base64 the
+// result: streaming payloads travel inside JSON []byte fields, which already
+// encode to base64 on the wire (design D8).
+func encryptStreamPayload(plaintext []byte, keyHex string) ([]byte, error) {
+	gcm, err := newGCM(keyHex)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+// encryptSSEChunk frames an encrypted SSE chunk as
+// len(plaintext, uint32 BE) || nonce(12) || ciphertext || tag(16).
+//
+// HTTP chunk boundaries are not a reliable framing signal on the client side
+// (a single chunk may be split across reads, or coalesced), so the plaintext
+// length is carried explicitly. WebSocket frames keep message boundaries and
+// use encryptStreamPayload without the prefix.
+func encryptSSEChunk(plaintext []byte, keyHex string) ([]byte, error) {
+	sealed, err := encryptStreamPayload(plaintext, keyHex)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 4+len(sealed))
+	binary.BigEndian.PutUint32(out[:4], uint32(len(plaintext)))
+	copy(out[4:], sealed)
+	return out, nil
+}
+
+// decryptSSEChunk reverses encryptSSEChunk.
+func decryptSSEChunk(data []byte, keyHex string) ([]byte, error) {
+	if len(data) < 4 {
+		return nil, fmt.Errorf("sse chunk too short")
+	}
+	want := binary.BigEndian.Uint32(data[:4])
+	plain, err := decryptStreamPayload(data[4:], keyHex)
+	if err != nil {
+		return nil, err
+	}
+	if uint32(len(plain)) != want {
+		return nil, fmt.Errorf("sse chunk length mismatch: got %d, want %d", len(plain), want)
+	}
+	return plain, nil
+}
+
+// decryptStreamPayload opens raw nonce(12)||ciphertext||tag(16) bytes produced
+// by encryptStreamPayload.
+func decryptStreamPayload(ciphertext []byte, keyHex string) ([]byte, error) {
+	gcm, err := newGCM(keyHex)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+	nonce, sealed := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return gcm.Open(nil, nonce, sealed, nil)
 }
 
 func encrypt(plaintext []byte, keyHex string) ([]byte, error) {

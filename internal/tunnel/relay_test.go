@@ -113,13 +113,17 @@ func (e *relayTestEnv) do(t *testing.T, method, path, token string) *httptest.Re
 
 // connectFakeTunnel registers a fake tunnel client for subdomain. reply, when
 // non-nil, is called for every forwarded request and its result written back.
-func connectFakeTunnel(t *testing.T, manager *tunnel.Manager, subdomain string, reply func(*tunnel.TunnelRequest) *tunnel.TunnelResponse) *websocket.Conn {
+func connectFakeTunnel(t *testing.T, manager *tunnel.Manager, subdomain string, reply func(*tunnel.TunnelRequest) *tunnel.TunnelResponse, proto ...string) *websocket.Conn {
 	t.Helper()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		manager.HandleWebSocket(w, r, subdomain)
 	}))
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/tunnel", nil)
+	header := http.Header{}
+	if len(proto) > 0 {
+		header.Set("X-Tunnel-Protocol", proto[0])
+	}
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/tunnel", header)
 	if err != nil {
 		srv.Close()
 		t.Fatalf("failed to dial fake tunnel: %v", err)
