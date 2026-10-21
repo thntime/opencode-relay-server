@@ -10,9 +10,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,6 +33,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/gorilla/websocket"
 	"github.com/skip2/go-qrcode"
+	"golang.org/x/crypto/scrypt"
 	"golang.org/x/term"
 )
 
@@ -48,7 +51,13 @@ const (
 	defaultRelay     = "https://opencode-relay.azurewebsites.net"
 	defaultPort      = "4096"
 	pairingInterval  = 2 * time.Second
+
+	keyKdfScrypt      = "scrypt-n15-r8-p1"
+	keyReportAttempts = 3
 )
+
+// keyReportRetryDelay is a var so tests can skip the backoff waits.
+var keyReportRetryDelay = time.Second
 
 type AuthConfig struct {
 	RelayURL string `json:"relay_url"`
@@ -57,13 +66,21 @@ type AuthConfig struct {
 }
 
 type DeviceConfig struct {
-	DeviceID      int64  `json:"id"`
-	DeviceName    string `json:"name"`
-	RelayURL      string `json:"relay_url"`
-	Subdomain     string `json:"subdomain"`
-	AuthUser      string `json:"auth_user"`
-	AuthPassword  string `json:"auth_password"`
+	DeviceID     int64  `json:"id"`
+	DeviceName   string `json:"name"`
+	RelayURL     string `json:"relay_url"`
+	Subdomain    string `json:"subdomain"`
+	AuthUser     string `json:"auth_user"`
+	AuthPassword string `json:"auth_password"`
+	// EncryptionKey is the hex E2E host key. It is stored locally in plaintext
+	// and protected only by device.json's 0600 permissions; the passphrase-wrapped
+	// copy (KeyWrapped) protects only the relay-side copy.
 	EncryptionKey string `json:"encryption_key,omitempty"`
+	HostID        string `json:"host_id,omitempty"`
+	HostName      string `json:"host_name,omitempty"`
+	KeyWrapped    string `json:"key_wrapped,omitempty"`
+	KeySalt       string `json:"key_salt,omitempty"`
+	KeyKdf        string `json:"key_kdf,omitempty"`
 }
 
 type OpenCodeConfig struct {
@@ -139,7 +156,15 @@ type TunnelClient struct {
 	httpClient   *http.Client
 	sseStopChan  chan struct{}
 	sseWaitGroup sync.WaitGroup
+	// sseStopMu guards the one-shot close of sseStopChan so connect()'s own
+	// teardown and an external Stop() cannot close it twice.
+	sseStopMu  sync.Mutex
+	sseStopped bool
 }
+
+// sseReconnectDelay is how long subscribeSSE waits before resubscribing after a
+// failed or dropped stream. It is a variable so tests can shorten it.
+var sseReconnectDelay = 3 * time.Second
 
 // imageCache stores base64 image URLs by partID for lazy loading
 var imageCache sync.Map
@@ -449,7 +474,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`OpenCode Anywhere
+	fmt.Printf(`OpenCode Anywhere
 
 Usage:
   tunnel-client [command] [options]
@@ -462,8 +487,18 @@ Commands:
   logout    Logout and clear credentials
 
 Options:
-  -port <port>   Local OpenCode port (default: 4096)
-  -relay <url>   Relay server URL (default: https://opencode-relay.victoriouswater-fc24e366.eastasia.azurecontainerapps.io)`)
+  -port <port>          Local OpenCode port (default: %s)
+  -relay <url>          Relay server URL (default: %s)
+  --name <name>         Host display name (default: OS hostname)
+  --token <token>       Relay API token (overrides saved credentials)
+  --email <email>       Account email for login
+  --password <pass>     Account password for login
+  --reset               Discard local identity and register again
+  --attach              Reuse a running instance (with --port)
+  --install             Register the host, wrap the E2E key, then enable autostart
+  --passphrase <pass>   E2E key passphrase (never stored)
+  --rewrap              Re-wrap the E2E key with a new passphrase
+`, defaultPort, defaultRelay)
 }
 
 func doLogin(relay string) *AuthConfig {
@@ -502,86 +537,322 @@ func doLogin(relay string) *AuthConfig {
 	return auth
 }
 
-func cmdStart() {
-	fmt.Printf("tunnel-client %s (built: %s, commit: %s)\n", buildVersion, buildTime, buildCommit)
+type startOptions struct {
+	Port       string
+	Relay      string
+	Name       string
+	Token      string
+	Email      string
+	Password   string
+	Passphrase string
+	Rewrap     bool
+	Reset      bool
+	Attach     bool
+	Install    bool
+}
 
-	localPort := defaultPort
-	relay := defaultRelay
-	portFromArg := false
-
-	for i := 1; i < len(os.Args); i++ {
-		switch os.Args[i] {
-		case "-port":
-			if i+1 < len(os.Args) {
-				localPort = os.Args[i+1]
-				portFromArg = true
+func parseStartArgs(args []string) startOptions {
+	opts := startOptions{Relay: defaultRelay}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-port", "--port":
+			if i+1 < len(args) {
+				opts.Port = args[i+1]
 				i++
 			}
-		case "-relay":
-			if i+1 < len(os.Args) {
-				relay = os.Args[i+1]
+		case "-relay", "--relay":
+			if i+1 < len(args) {
+				opts.Relay = args[i+1]
 				i++
 			}
+		case "--name":
+			if i+1 < len(args) {
+				opts.Name = args[i+1]
+				i++
+			}
+		case "--token":
+			if i+1 < len(args) {
+				opts.Token = args[i+1]
+				i++
+			}
+		case "--email":
+			if i+1 < len(args) {
+				opts.Email = args[i+1]
+				i++
+			}
+		case "--password":
+			if i+1 < len(args) {
+				opts.Password = args[i+1]
+				i++
+			}
+		case "--passphrase":
+			if i+1 < len(args) {
+				opts.Passphrase = args[i+1]
+				i++
+			}
+		case "--rewrap":
+			opts.Rewrap = true
+		case "--reset":
+			opts.Reset = true
+		case "--attach":
+			opts.Attach = true
+		case "--install":
+			opts.Install = true
 		}
 	}
+	return opts
+}
 
-	if !portFromArg {
+// resolveAuth applies the credential priority:
+// --token > OPENCODE_RELAY_TOKEN > auth.json > --email/--password login.
+func resolveAuth(relay string, opts startOptions) (*AuthConfig, error) {
+	if opts.Token != "" {
+		return &AuthConfig{RelayURL: relay, Token: opts.Token}, nil
+	}
+	if token := os.Getenv("OPENCODE_RELAY_TOKEN"); token != "" {
+		return &AuthConfig{RelayURL: relay, Token: token}, nil
+	}
+	if auth, err := loadAuthConfig(); err == nil && auth.Token != "" {
+		return auth, nil
+	}
+	if opts.Email == "" && opts.Password == "" {
+		return nil, fmt.Errorf("no credentials: use --token, OPENCODE_RELAY_TOKEN, or --email/--password")
+	}
+	if opts.Email == "" || opts.Password == "" {
+		return nil, fmt.Errorf("--email and --password must be provided together")
+	}
+
+	token, email, err := login(relay, opts.Email, opts.Password)
+	if err != nil {
+		return nil, err
+	}
+	auth := &AuthConfig{RelayURL: relay, Token: token, Email: email}
+	if err := saveAuthConfig(auth); err != nil {
+		return nil, err
+	}
+	return auth, nil
+}
+
+// tunnelRunner is a seam so tests can drive cmdStart's failure branches without
+// opening a real tunnel.
+var tunnelRunner = runTunnel
+
+// fatalExit is a seam so tests can observe terminal failure branches without
+// terminating the test process.
+var fatalExit = func(format string, v ...interface{}) {
+	log.Fatalf(format, v...)
+}
+
+func cmdStart() {
+	fmt.Printf("tunnel-client %s (built: %s, commit: %s)\n", buildVersion, buildTime, buildCommit)
+	opts := parseStartArgs(os.Args[1:])
+
+	localPort := opts.Port
+	if localPort == "" {
+		localPort = defaultPort
 		if ocConfig, _ := loadOpenCodeConfig(); ocConfig != nil && ocConfig.Port != "" {
 			localPort = ocConfig.Port
 		}
 	}
 
-	ensureOpenCodeRunning(localPort)
+	relay := opts.Relay
+	name := opts.Name
+	if name == "" {
+		name, _ = os.Hostname()
+	}
+	if name == "" {
+		name = "OpenCode Host"
+	}
+
+	// --install only validates the identity and registers autostart; it never
+	// enters the tunnel loop.
+	if opts.Install {
+		if err := installAutoStart(opts, relay, name, localPort); err != nil {
+			log.Fatalf("--install 失败: %v", err)
+		}
+		return
+	}
+
+	if err := prepareLocalServer(opts, localPort); err != nil {
+		log.Fatalf("%v", err)
+	}
+
+	var auth *AuthConfig
+	reset := opts.Reset
+	rewrap := opts.Rewrap
+	needKeySetup := true
+	warnedNoPassphrase := false
+	reregistered := false
+	backoff := time.Second
+	const maxBackoff = 10 * time.Second
 
 	for {
-		device, err := loadDeviceConfig()
-		if err == nil && device != nil {
-			fmt.Printf("  Using device: %s\n", device.DeviceName)
-			fmt.Printf("  Connecting to relay server...\n")
-			if runTunnel(device, localPort) {
-				return
+		device := loadExistingDevice(reset)
+		if device == nil {
+			if auth == nil {
+				var err error
+				auth, err = resolveAuth(relay, opts)
+				if err != nil {
+					log.Fatalf("Failed to resolve credentials: %v", err)
+				}
+				if relay == defaultRelay && auth.RelayURL != "" {
+					relay = auth.RelayURL
+				}
 			}
-			fmt.Println()
-			fmt.Println("  ⚠ Connection failed. This could be because:")
-			fmt.Println("    - The device was deleted from your account")
-			fmt.Println("    - Network connectivity issues")
-			fmt.Println("    - The relay server is temporarily unavailable")
-			fmt.Println()
-			fmt.Println("  Clearing old device config and starting fresh pairing...")
-			fmt.Println()
-			clearDeviceConfig()
+			var err error
+			device, err = ensureHost(relay, auth.Token, name, reset)
+			if err != nil {
+				log.Fatalf("Failed to register host: %v", err)
+			}
+		}
+		reset = false
+
+		if needKeySetup {
+			token := ""
+			if auth != nil {
+				token = auth.Token
+			} else if resolved, authErr := resolveAuth(relay, opts); authErr == nil {
+				auth = resolved
+				token = resolved.Token
+			}
+			if token == "" {
+				fmt.Println("  ⚠ 未找到可用令牌，跳过 E2E 密钥上报；隧道仍可建立。")
+			} else if err := prepareHostKey(relay, token, device, opts.Passphrase, rewrap); errors.Is(err, errNoPassphrase) && !warnedNoPassphrase {
+				fmt.Println("  ⚠ 未提供 E2E 口令（--passphrase / OPENCODE_TUNNEL_PASSPHRASE），跳过密钥上报；隧道仍可建立。")
+				warnedNoPassphrase = true
+			}
+			rewrap = false
+			needKeySetup = false
 		}
 
-		auth, err := loadAuthConfig()
+		fmt.Printf("  Using device: %s\n", device.DeviceName)
+		fmt.Printf("  Connecting to relay server...\n")
+		err := tunnelRunner(device, localPort)
+		if err == nil {
+			return
+		}
+
+		switch classifyFailure(err) {
+		case failureCredential:
+			fmt.Println("\n  ✗ 凭据已失效，请重新登录或使用 --reset")
+			fatalExit("凭据已失效，请重新登录或使用 --reset")
+		case failureProtocol:
+			fatalExit("协议版本不匹配：请升级 tunnel-client 或 Relay 服务端（%v）", err)
+		case failurePolicy:
+			fmt.Printf("\n  ✗ 服务端拒绝连接: %v\n", err)
+			fatalExit("服务端拒绝连接，已停止重连（%v）", err)
+		case failureNotFound:
+			if reregistered {
+				fmt.Println("\n  ✗ 重新注册后主机仍不存在，凭据可能已失效")
+				fatalExit("凭据已失效，请重新登录或使用 --reset")
+			}
+			fmt.Println("\n  ⚠ 主机不存在，正在使用本地凭据重新注册...")
+			if auth == nil {
+				var authErr error
+				auth, authErr = resolveAuth(relay, opts)
+				if authErr != nil {
+					log.Fatalf("Failed to resolve credentials: %v", authErr)
+				}
+			}
+			reuseName := device.HostName
+			if reuseName == "" {
+				reuseName = name
+			}
+			// Re-registration must keep the existing E2E material: the wrapped
+			// copy is still valid for the same local host key, and losing it
+			// would force an unnecessary re-wrap (and a passphrase prompt).
+			prevKey := device.EncryptionKey
+			prevWrapped, prevSalt, prevKdf := device.KeyWrapped, device.KeySalt, device.KeyKdf
+			refreshed, err := ensureHost(relay, auth.Token, reuseName, false)
+			if err != nil {
+				fmt.Printf("\n  ✗ 重新注册失败: %v\n", err)
+				log.Fatalf("凭据已失效，请重新登录或使用 --reset")
+			}
+			refreshed.EncryptionKey = prevKey
+			refreshed.KeyWrapped, refreshed.KeySalt, refreshed.KeyKdf = prevWrapped, prevSalt, prevKdf
+			if err := saveDeviceConfig(refreshed); err != nil {
+				log.Fatalf("Failed to save device config: %v", err)
+			}
+			reregistered = true
+			needKeySetup = true
+			continue
+		default:
+			delay := backoffDelay(backoff)
+			fmt.Printf("\n  ⚠ 网络错误: %v，%v 后重连\n", err, delay.Round(time.Millisecond))
+			time.Sleep(delay)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+// probeLocalServer reports whether something already answers on the local port.
+// It is a package-level var so tests can stub the network probe.
+var probeLocalServer = func(port string) error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	// Use 127.0.0.1 instead of localhost to avoid IPv6 timeout issues
+	url := fmt.Sprintf("http://127.0.0.1:%s", port)
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// prepareLocalServer decides how the local OpenCode instance is obtained:
+// --attach reuses one that must already be listening, otherwise the existing
+// detect-and-spawn logic runs.
+func prepareLocalServer(opts startOptions, localPort string) error {
+	if opts.Attach {
+		if err := probeLocalServer(localPort); err != nil {
+			debugLog("[attach] probe failed on port %s: %v", localPort, err)
+			return fmt.Errorf("--attach 指定端口 %s 无响应，请先启动 opencode serve", localPort)
+		}
+		debugLog("[attach] reusing OpenCode already listening on port %s", localPort)
+		return nil
+	}
+	ensureOpenCodeRunning(localPort)
+	return nil
+}
+
+// installAutoStart makes sure the host is registered with wrapped E2E key
+// material, then installs the OS autostart entry. It never starts the tunnel,
+// and it fails loudly when key wrapping needs a passphrase it cannot obtain.
+func installAutoStart(opts startOptions, relay, name, localPort string) error {
+	device := loadExistingDevice(opts.Reset)
+	// Key setup is needed when the identity or key material is incomplete, and
+	// also when --rewrap explicitly asks for fresh wrapped material even though
+	// the existing identity is complete.
+	needsKeySetup := device == nil || device.HostID == "" ||
+		device.KeyWrapped == "" || device.KeySalt == "" || device.KeyKdf == "" ||
+		opts.Rewrap
+	if needsKeySetup {
+		auth, err := resolveAuth(relay, opts)
 		if err != nil {
-			auth = doLogin(relay)
+			return fmt.Errorf("resolve credentials: %w", err)
 		}
-
 		if relay == defaultRelay && auth.RelayURL != "" {
 			relay = auth.RelayURL
 		}
-
-		device, err = startPairing(relay, auth.Token, localPort)
-		if err != nil {
-			if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "unauthorized") {
-				fmt.Println("  Session expired. Please login again.")
-				clearAuthConfig()
-				continue
+		if device == nil || device.HostID == "" {
+			device, err = ensureHost(relay, auth.Token, name, opts.Reset)
+			if err != nil {
+				return fmt.Errorf("register host: %w", err)
 			}
-			log.Printf("Pairing failed: %v. Retrying in 5s...", err)
-			time.Sleep(5 * time.Second)
-			continue
 		}
-
-		device.RelayURL = relay
-		if err := saveDeviceConfig(device); err != nil {
-			log.Fatalf("Failed to save device config: %v", err)
+		if err := prepareHostKey(relay, auth.Token, device, opts.Passphrase, opts.Rewrap); err != nil {
+			return err
 		}
-
-		fmt.Printf("\n✓ Device \"%s\" paired successfully!\n", device.DeviceName)
-
-		setupAutoStart(localPort)
 	}
+
+	if err := setupAutoStart(localPort); err != nil {
+		return fmt.Errorf("setup autostart: %w", err)
+	}
+	fmt.Printf("✓ 已配置开机自启（端口 %s）\n", localPort)
+	return nil
 }
 
 func cmdStatus() {
@@ -600,7 +871,13 @@ func cmdStatus() {
 
 	if device != nil {
 		fmt.Printf("\nDevice: %s\n", device.DeviceName)
+		fmt.Printf("Host ID: %s\n", device.HostID)
 		fmt.Printf("Subdomain: %s\n", device.Subdomain)
+		if device.KeyWrapped != "" {
+			fmt.Println("E2E key: present")
+		} else {
+			fmt.Println("E2E key: missing")
+		}
 	} else {
 		fmt.Println("\nNo device paired")
 	}
@@ -662,7 +939,8 @@ func cmdPair() {
 	setupAutoStart(localPort)
 }
 
-func ensureOpenCodeRunning(port string) {
+// ensureOpenCodeRunning is a package-level var so tests can stub the spawn path.
+var ensureOpenCodeRunning = func(port string) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	// Use 127.0.0.1 instead of localhost to avoid IPv6 timeout issues
 	url := fmt.Sprintf("http://127.0.0.1:%s", port)
@@ -927,6 +1205,146 @@ func login(relayURL, email, password string) (string, string, error) {
 	return result.Token, result.User.Email, nil
 }
 
+type deviceRecord struct {
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	Subdomain    string `json:"subdomain"`
+	AuthUser     string `json:"auth_user"`
+	AuthPassword string `json:"auth_password"`
+}
+
+func listDevices(relay, token string) ([]deviceRecord, error) {
+	req, err := http.NewRequest("GET", relay+"/api/devices", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 10 * time.Second, Transport: createRelayTransport()}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to list devices: %s", string(bodyBytes))
+	}
+
+	var devices []deviceRecord
+	if err := json.NewDecoder(resp.Body).Decode(&devices); err != nil {
+		return nil, err
+	}
+	return devices, nil
+}
+
+func deviceConfigFromRecord(d deviceRecord, relay string) *DeviceConfig {
+	return &DeviceConfig{
+		DeviceID:     d.ID,
+		DeviceName:   d.Name,
+		RelayURL:     relay,
+		Subdomain:    d.Subdomain,
+		AuthUser:     d.AuthUser,
+		AuthPassword: d.AuthPassword,
+		HostID:       d.Subdomain,
+		HostName:     d.Name,
+	}
+}
+
+// registerHost reuses the device already registered under name, or creates it.
+func registerHost(relay, token, name string) (*DeviceConfig, error) {
+	existing, err := findDeviceByName(relay, token, name)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		return deviceConfigFromRecord(*existing, relay), nil
+	}
+
+	body, _ := json.Marshal(map[string]string{"name": name})
+	req, err := http.NewRequest("POST", relay+"/api/devices", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second, Transport: createRelayTransport()}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 201 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to register host: %s", string(bodyBytes))
+	}
+
+	var created deviceRecord
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		return nil, err
+	}
+	return deviceConfigFromRecord(created, relay), nil
+}
+
+func findDeviceByName(relay, token, name string) (*deviceRecord, error) {
+	devices, err := listDevices(relay, token)
+	if err != nil {
+		return nil, err
+	}
+	for i := range devices {
+		if devices[i].Name == name {
+			return &devices[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// ensureHost registers the host and persists the identity to device.json.
+func ensureHost(relay, token, name string, reset bool) (*DeviceConfig, error) {
+	if reset {
+		clearDeviceConfig()
+		if existing, err := findDeviceByName(relay, token, name); err == nil && existing != nil {
+			return nil, fmt.Errorf("同名主机已存在，请用 --name 区分")
+		}
+	}
+
+	// A local identity already bound to a HostID must not silently adopt a
+	// same-name server record that points at a different device.
+	if local, err := loadDeviceConfig(); err == nil && local.HostID != "" {
+		existing, err := findDeviceByName(relay, token, name)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil && existing.Subdomain != local.HostID {
+			return nil, fmt.Errorf("同名主机已绑定其他设备，请用 --name 区分")
+		}
+	}
+
+	device, err := registerHost(relay, token, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := saveDeviceConfig(device); err != nil {
+		return nil, err
+	}
+	return device, nil
+}
+
+// loadExistingDevice returns the saved identity unless --reset discards it.
+func loadExistingDevice(reset bool) *DeviceConfig {
+	if reset {
+		return nil
+	}
+	device, err := loadDeviceConfig()
+	if err != nil {
+		return nil
+	}
+	return device
+}
+
 func startPairing(relayURL, token, localPort string) (*DeviceConfig, error) {
 	req, _ := http.NewRequest("POST", relayURL+"/api/pairing", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -949,7 +1367,10 @@ func startPairing(relayURL, token, localPort string) (*DeviceConfig, error) {
 	}
 
 	hostname, _ := os.Hostname()
-	encryptionKey := generateEncryptionKey()
+	encryptionKey, err := generateEncryptionKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate encryption key: %w", err)
+	}
 
 	qrData := QRData{
 		Version:       1,
@@ -1018,12 +1439,9 @@ func pollPairingStatus(relayURL, token, pairingID string, expiresAt time.Time) (
 	}
 }
 
-func runTunnel(config *DeviceConfig, localPort string) bool {
-	if !verifyDeviceWithServer(config) {
-		fmt.Println("\n⚠ Device verification failed. Device may have been removed or credentials are invalid.")
-		fmt.Println("  Please re-pair your device.")
-		clearDeviceConfig()
-		return false
+func runTunnel(config *DeviceConfig, localPort string) error {
+	if err := verifyDeviceWithServer(config); err != nil {
+		return err
 	}
 
 	client := &TunnelClient{
@@ -1036,21 +1454,32 @@ func runTunnel(config *DeviceConfig, localPort string) bool {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	defer signal.Stop(sigChan)
+
+	// The watcher must exit when this attempt ends, otherwise every reconnect
+	// leaves a goroutine parked on sigChan forever.
+	watcherDone := make(chan struct{})
+	defer close(watcherDone)
 
 	go func() {
-		sig := <-sigChan
-		log.Printf("Received signal: %v (PID: %d)", sig, os.Getpid())
-		fmt.Printf("\nShutting down due to signal: %v...\n", sig)
-		if client.conn != nil {
-			client.conn.Close()
+		select {
+		case sig := <-sigChan:
+			log.Printf("Received signal: %v (PID: %d)", sig, os.Getpid())
+			fmt.Printf("\nShutting down due to signal: %v...\n", sig)
+			if client.conn != nil {
+				client.conn.Close()
+			}
+			os.Exit(0)
+		case <-watcherDone:
 		}
-		os.Exit(0)
 	}()
 
 	return client.connectWithRetry()
 }
 
-func verifyDeviceWithServer(config *DeviceConfig) bool {
+// verifyDeviceWithServer reports whether the saved identity still exists on the
+// relay. HTTP status is carried in the error so classifyFailure can decide.
+func verifyDeviceWithServer(config *DeviceConfig) error {
 	reqBody, _ := json.Marshal(map[string]string{
 		"subdomain":     config.Subdomain,
 		"auth_user":     config.AuthUser,
@@ -1060,85 +1489,124 @@ func verifyDeviceWithServer(config *DeviceConfig) bool {
 	client := &http.Client{Timeout: 10 * time.Second, Transport: createRelayTransport()}
 	resp, err := client.Post(config.RelayURL+"/api/device/verify", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
-		debugLog("[verify] Request failed: %v, proceeding anyway", err)
-		return true
+		// A network hiccup here is not evidence against the identity; let the
+		// WebSocket dial below decide and retry.
+		debugLog("[verify] Request failed: %v, proceeding to dial", err)
+		return nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 200 {
 		debugLog("[verify] Device verified successfully")
-		return true
+		return nil
 	}
 
 	body, _ := io.ReadAll(resp.Body)
 	debugLog("[verify] Device verification failed: status=%d, body=%s", resp.StatusCode, string(body))
-
-	if resp.StatusCode == 404 || resp.StatusCode == 401 {
-		return false
-	}
-
-	return true
+	return &httpStatusError{Op: "verify", Status: resp.StatusCode}
 }
 
-func (c *TunnelClient) connectWithRetry() bool {
+type failureKind int
+
+const (
+	failureNetwork failureKind = iota
+	failureCredential
+	failureNotFound
+	failureProtocol
+	failurePolicy
+)
+
+// httpStatusError keeps an HTTP status on the error so failure classification
+// does not have to grep for digits.
+type httpStatusError struct {
+	Op     string
+	Status int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s: status %d", e.Op, e.Status)
+}
+
+// classifyFailure maps a tunnel failure to the D4 table. Unknown errors are
+// treated as network failures because retrying is safe; only credentials stop.
+func classifyFailure(err error) failureKind {
+	if err == nil {
+		return failureNetwork
+	}
+
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		switch {
+		case statusErr.Status == http.StatusUnauthorized, statusErr.Status == http.StatusForbidden:
+			return failureCredential
+		case statusErr.Status == http.StatusNotFound:
+			return failureNotFound
+		case statusErr.Status >= 500:
+			return failureNetwork
+		case statusErr.Status >= 400:
+			// The server refused the upgrade (e.g. 400/426): version mismatch.
+			return failureProtocol
+		default:
+			return failureNetwork
+		}
+	}
+
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		switch closeErr.Code {
+		case websocket.ClosePolicyViolation, // 1008: server refused the client
+			websocket.CloseUnsupportedData: // 1003: server cannot handle the stream
+			return failurePolicy
+		default:
+			// 1000/1001/1006/1011 and unknown codes are transient: reconnect.
+			// 1011 in particular means the relay hit an unexpected condition
+			// (restart, crash, upgrade), which must not disable a daemon.
+			return failureNetwork
+		}
+	}
+
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "bad handshake"):
+		return failureProtocol
+	case strings.Contains(msg, "401"), strings.Contains(msg, "403"),
+		strings.Contains(msg, "Unauthorized"), strings.Contains(msg, "Forbidden"):
+		return failureCredential
+	case strings.Contains(msg, "404"), strings.Contains(msg, "not found"):
+		return failureNotFound
+	}
+	return failureNetwork
+}
+
+// backoffDelay applies ±20% jitter to d.
+func backoffDelay(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * (0.8 + 0.4*mrand.Float64()))
+}
+
+// connectWithRetry keeps the identity on every failure: network errors retry
+// with backoff, everything else is handed back to cmdStart for a decision.
+func (c *TunnelClient) connectWithRetry() error {
 	backoff := time.Second
-	maxBackoff := 10 * time.Second
+	const maxBackoff = 10 * time.Second
 
 	for {
 		err := c.connect()
-		if err != nil {
-			if isAuthError(err) {
-				fmt.Println("\n⚠ Device authentication failed. Device may have been removed.")
-				clearDeviceConfig()
-				return false
-			}
-
-			if isAbnormalClose(err) {
-				log.Printf("Connection lost. Reconnecting...")
-				backoff = time.Second
-			} else {
-				log.Printf("Connection error: %v. Retrying in %v...", err, backoff)
-				time.Sleep(backoff)
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-			}
+		if err == nil {
+			backoff = time.Second
 			continue
 		}
-		backoff = time.Second
-	}
-}
+		if classifyFailure(err) != failureNetwork {
+			return err
+		}
 
-func isAbnormalClose(err error) bool {
-	if err == nil {
-		return false
+		delay := backoffDelay(backoff)
+		log.Printf("Connection error: %v. Retrying in %v...", err, delay)
+		time.Sleep(delay)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
 	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "1006") ||
-		strings.Contains(errStr, "unexpected EOF") ||
-		strings.Contains(errStr, "connection reset")
-}
-
-func isAuthError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	// Check for HTTP status codes in error
-	if strings.Contains(errStr, "401") ||
-		strings.Contains(errStr, "403") ||
-		strings.Contains(errStr, "404") ||
-		strings.Contains(errStr, "Unauthorized") ||
-		strings.Contains(errStr, "Forbidden") {
-		return true
-	}
-	// Check for bad handshake which happens when server rejects before upgrade
-	// This indicates auth/device validation failed
-	if strings.Contains(errStr, "bad handshake") {
-		return true
-	}
-	return false
 }
 
 func clearDeviceConfig() {
@@ -1149,6 +1617,11 @@ func clearDeviceConfig() {
 func clearAuthConfig() {
 	path := filepath.Join(getConfigDir(), authFileName)
 	os.Remove(path)
+}
+
+// wsDial is a seam so tests can exercise the failed-handshake cleanup path.
+var wsDial = func(d *websocket.Dialer, urlStr string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	return d.Dial(urlStr, header)
 }
 
 func (c *TunnelClient) connect() error {
@@ -1175,8 +1648,17 @@ func (c *TunnelClient) connect() error {
 			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(resolvedIP, port))
 		},
 	}
-	conn, _, err := dialer.Dial(wsURL, nil)
+	conn, resp, err := wsDial(&dialer, wsURL, nil)
 	if err != nil {
+		if resp != nil {
+			// The caller owns the response body when the handshake fails. Drain
+			// and close it, otherwise every retry leaks a connection.
+			if resp.Body != nil {
+				io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+				resp.Body.Close()
+			}
+			return &httpStatusError{Op: "dial", Status: resp.StatusCode}
+		}
 		return fmt.Errorf("dial failed: %w", err)
 	}
 	c.conn = conn
@@ -1190,14 +1672,12 @@ func (c *TunnelClient) connect() error {
 		return nil
 	})
 
-	c.sseStopChan = make(chan struct{})
-	c.sseWaitGroup.Add(1)
-	go c.subscribeSSE()
+	c.startSSE()
 
 	done := make(chan struct{})
 	defer func() {
 		close(done)
-		close(c.sseStopChan)
+		c.stopSSE()
 		c.sseWaitGroup.Wait()
 	}()
 
@@ -1278,38 +1758,98 @@ func (c *TunnelClient) buildWebSocketURL() string {
 	q.Set("auth_password", c.config.AuthPassword)
 	u.RawQuery = q.Encode()
 
-	debugLog("[debug] WebSocket URL: %s (subdomain: %s)", u.String(), c.config.Subdomain)
+	// Never log the full URL: it carries auth_password in the query string.
+	debugLog("[debug] WebSocket URL: %s://%s%s (subdomain: %s)", u.Scheme, u.Host, u.Path, c.config.Subdomain)
 	return u.String()
 }
 
-func (c *TunnelClient) subscribeSSE() {
-	defer c.sseWaitGroup.Done()
+// startSSE launches the local event-stream subscription for this tunnel
+// connection. Each connection gets a fresh stop channel.
+func (c *TunnelClient) startSSE() {
+	stop := make(chan struct{})
 
+	c.sseStopMu.Lock()
+	c.sseStopChan = stop
+	c.sseStopped = false
+	c.sseStopMu.Unlock()
+
+	c.sseWaitGroup.Add(1)
+	go func() {
+		// Done lives with the launcher so callers can register their own
+		// completion signal before it, guaranteeing it runs first.
+		defer c.sseWaitGroup.Done()
+		c.subscribeSSE(stop)
+	}()
+}
+
+// stopSSE closes the subscription stop channel exactly once. It never blocks,
+// so it is safe to call from both connect()'s teardown and Stop().
+func (c *TunnelClient) stopSSE() {
+	c.sseStopMu.Lock()
+	ch := c.sseStopChan
+	if ch == nil || c.sseStopped {
+		c.sseStopMu.Unlock()
+		return
+	}
+	c.sseStopped = true
+	c.sseStopMu.Unlock()
+
+	close(ch)
+}
+
+// Stop ends the event-stream subscription and waits for it to exit. A
+// re-registration builds a new TunnelClient, so the previous instance must be
+// stopped before its events are allowed to keep flowing.
+func (c *TunnelClient) Stop() {
+	c.stopSSE()
+	c.sseWaitGroup.Wait()
+}
+
+func (c *TunnelClient) subscribeSSE(stop <-chan struct{}) {
 	sseURL := fmt.Sprintf("http://127.0.0.1:%s/event", c.localPort)
 	debugLog("[SSE] Subscribing to %s", sseURL)
 
 	for {
 		select {
-		case <-c.sseStopChan:
+		case <-stop:
 			debugLog("[SSE] Stopping subscription")
 			return
 		default:
 		}
 
-		err := c.connectSSE(sseURL)
-		if err != nil {
-			debugLog("[SSE] Connection error: %v, reconnecting in 3s...", err)
-			select {
-			case <-c.sseStopChan:
-				return
-			case <-time.After(3 * time.Second):
-			}
+		err := c.connectSSE(stop, sseURL)
+		if err == nil {
+			// connectSSE only reports success when the subscription stopped.
+			debugLog("[SSE] Subscription stopped")
+			return
+		}
+
+		debugLog("[SSE] Connection error: %v, reconnecting in %v...", err, sseReconnectDelay)
+		select {
+		case <-stop:
+			return
+		case <-time.After(sseReconnectDelay):
 		}
 	}
 }
 
-func (c *TunnelClient) connectSSE(sseURL string) error {
-	req, err := http.NewRequest("GET", sseURL, nil)
+func (c *TunnelClient) connectSSE(stop <-chan struct{}, sseURL string) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A read parked on an idle stream must not outlive the stop signal,
+	// otherwise Stop() would block until the local server happens to speak.
+	watcherDone := make(chan struct{})
+	defer close(watcherDone)
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-watcherDone:
+		}
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", sseURL, nil)
 	if err != nil {
 		return err
 	}
@@ -1335,46 +1875,59 @@ func (c *TunnelClient) connectSSE(sseURL string) error {
 
 	for {
 		select {
-		case <-c.sseStopChan:
+		case <-stop:
 			return nil
 		default:
 		}
 
-		n, err := reader.Read(tmp)
-		if err != nil {
-			if err == io.EOF {
-				return fmt.Errorf("SSE connection closed")
+		n, readErr := reader.Read(tmp)
+		if n > 0 {
+			// Process whatever arrived before honouring the error: a stream that
+			// closes right after its last event returns data and io.EOF in the
+			// same call, and dropping that chunk loses the final event.
+			buf = append(buf, tmp[:n]...)
+
+			for {
+				idx := bytes.Index(buf, []byte("\n\n"))
+				if idx == -1 {
+					break
+				}
+
+				eventData := buf[:idx]
+				buf = buf[idx+2:]
+
+				c.processSSEEvent(eventData)
 			}
-			return err
 		}
 
-		buf = append(buf, tmp[:n]...)
-
-		for {
-			idx := bytes.Index(buf, []byte("\n\n"))
-			if idx == -1 {
-				break
+		if readErr != nil {
+			if readErr == io.EOF {
+				return fmt.Errorf("SSE connection closed")
 			}
-
-			eventData := buf[:idx]
-			buf = buf[idx+2:]
-
-			c.processSSEEvent(eventData)
+			return readErr
 		}
 	}
 }
 
 func (c *TunnelClient) processSSEEvent(eventData []byte) {
 	lines := bytes.Split(eventData, []byte("\n"))
-	var data []byte
+	var dataLines [][]byte
 
 	for _, line := range lines {
 		if bytes.HasPrefix(line, []byte("data:")) {
-			data = bytes.TrimPrefix(line, []byte("data:"))
-			data = bytes.TrimSpace(data)
+			value := bytes.TrimPrefix(line, []byte("data:"))
+			// SSE strips a single optional space after the colon.
+			value = bytes.TrimPrefix(value, []byte(" "))
+			dataLines = append(dataLines, value)
 		}
 	}
 
+	if len(dataLines) == 0 {
+		return
+	}
+
+	// Multiple data: lines belong to one event; the spec joins them with "\n".
+	data := bytes.TrimSpace(bytes.Join(dataLines, []byte("\n")))
 	if len(data) == 0 {
 		return
 	}
@@ -1712,7 +2265,13 @@ func stripBase64Images(body []byte, path string) ([]byte, bool) {
 	return newBody, true
 }
 
+// configDirOverride lets tests point config reads/writes at t.TempDir().
+var configDirOverride string
+
 func getConfigDir() string {
+	if configDirOverride != "" {
+		return configDirOverride
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, configDir)
 }
@@ -1752,6 +2311,12 @@ func loadDeviceConfig() (*DeviceConfig, error) {
 	if config.Subdomain == "" || config.AuthUser == "" || config.AuthPassword == "" {
 		return nil, fmt.Errorf("incomplete device config")
 	}
+	if config.HostID == "" {
+		config.HostID = config.Subdomain
+	}
+	if config.HostName == "" {
+		config.HostName, _ = os.Hostname()
+	}
 	return &config, nil
 }
 
@@ -1764,7 +2329,8 @@ func saveDeviceConfig(config *DeviceConfig) error {
 	return os.WriteFile(filepath.Join(dir, deviceFileName), data, 0600)
 }
 
-func setupAutoStart(localPort string) error {
+// setupAutoStart is a package-level var so tests can observe the install call.
+var setupAutoStart = func(localPort string) error {
 	switch runtime.GOOS {
 	case "darwin":
 		return setupLaunchd(localPort)
@@ -1910,10 +2476,188 @@ func setupWindowsTask(localPort string) error {
 	return nil
 }
 
-func generateEncryptionKey() string {
+var errNoPassphrase = errors.New("no E2E passphrase provided")
+
+// stdinIsTerminal is a seam so tests never block on a prompt.
+var stdinIsTerminal = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
+
+// resolvePassphrase applies D5 priority: --passphrase > env > interactive prompt.
+func resolvePassphrase(flagValue string) (string, error) {
+	if flagValue != "" {
+		return flagValue, nil
+	}
+	if p := os.Getenv("OPENCODE_TUNNEL_PASSPHRASE"); p != "" {
+		return p, nil
+	}
+	if !stdinIsTerminal() {
+		return "", errNoPassphrase
+	}
+	fmt.Print("E2E 口令（不会保存）: ")
+	raw, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	if err != nil {
+		return "", fmt.Errorf("读取口令失败: %w", err)
+	}
+	if len(raw) == 0 {
+		return "", errNoPassphrase
+	}
+	return string(raw), nil
+}
+
+// ensureHostKey wraps the host key when key material is missing or --rewrap is
+// set. It only reports errNoPassphrase when wrapping is actually needed.
+func ensureHostKey(device *DeviceConfig, passphrase string, rewrap bool) (bool, error) {
+	if !rewrap && device.KeyWrapped != "" && device.KeySalt != "" && device.KeyKdf != "" {
+		return false, nil
+	}
+	if passphrase == "" {
+		return false, errNoPassphrase
+	}
+	if device.EncryptionKey == "" {
+		key, err := generateEncryptionKey()
+		if err != nil {
+			return false, err
+		}
+		device.EncryptionKey = key
+	}
+
+	wrapped, salt, err := wrapHostKey(passphrase, device.EncryptionKey)
+	if err != nil {
+		return false, err
+	}
+	device.KeyWrapped, device.KeySalt, device.KeyKdf = wrapped, salt, keyKdfScrypt
+	return true, nil
+}
+
+// wrapHostKey encrypts the hex host key with a passphrase-derived KEK (D5).
+func wrapHostKey(passphrase, hostKeyHex string) (wrapped, saltB64 string, err error) {
+	hostKey, err := hex.DecodeString(hostKeyHex)
+	if err != nil {
+		return "", "", err
+	}
+
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", "", err
+	}
+	kek, err := scrypt.Key([]byte(passphrase), salt, 32768, 8, 1, 32)
+	if err != nil {
+		return "", "", err
+	}
+
+	wrappedBytes, err := encrypt(hostKey, hex.EncodeToString(kek))
+	if err != nil {
+		return "", "", err
+	}
+	return string(wrappedBytes), base64.StdEncoding.EncodeToString(salt), nil
+}
+
+func unwrapHostKey(passphrase, wrapped, saltB64 string) (string, error) {
+	salt, err := base64.StdEncoding.DecodeString(saltB64)
+	if err != nil {
+		return "", fmt.Errorf("密钥盐无效: %w", err)
+	}
+	kek, err := scrypt.Key([]byte(passphrase), salt, 32768, 8, 1, 32)
+	if err != nil {
+		return "", err
+	}
+
+	hostKey, err := decrypt([]byte(wrapped), hex.EncodeToString(kek))
+	if err != nil {
+		return "", fmt.Errorf("解包失败：口令错误或密钥材料损坏")
+	}
+	return hex.EncodeToString(hostKey), nil
+}
+
+// prepareHostKey persists wrapped key material and reports it. Reporting never
+// blocks the tunnel: failures are warnings retried on the next start. It returns
+// errNoPassphrase when wrapping was needed but no passphrase was available.
+func prepareHostKey(relay, token string, device *DeviceConfig, passphrase string, rewrap bool) error {
+	changed, err := ensureHostKey(device, passphrase, rewrap)
+	if errors.Is(err, errNoPassphrase) {
+		passphrase, err = resolvePassphrase("")
+		if err != nil {
+			return errNoPassphrase
+		}
+		changed, err = ensureHostKey(device, passphrase, rewrap)
+	}
+	if err != nil {
+		fmt.Printf("  ⚠ E2E 密钥包裹失败: %v\n", err)
+		return err
+	}
+
+	if changed {
+		if err := saveDeviceConfig(device); err != nil {
+			fmt.Printf("  ⚠ 保存 device.json 失败: %v\n", err)
+			return err
+		}
+	}
+
+	if err := reportHostKey(relay, token, device.HostID, device); err != nil {
+		fmt.Printf("  ⚠ E2E 密钥上报失败: %v（隧道继续运行，下次启动重试）\n", err)
+	}
+	return nil
+}
+
+// reportHostKey retries transient failures up to keyReportAttempts; credential
+// failures stop immediately.
+func reportHostKey(relay, token, hostID string, device *DeviceConfig) error {
+	body, _ := json.Marshal(map[string]string{
+		"key_wrapped": device.KeyWrapped,
+		"key_salt":    device.KeySalt,
+		"key_kdf":     device.KeyKdf,
+	})
+
+	var lastErr error
+	for attempt := 1; attempt <= keyReportAttempts; attempt++ {
+		lastErr = putHostKey(relay, token, hostID, body)
+		if lastErr == nil {
+			return nil
+		}
+		var statusErr *httpStatusError
+		if errors.As(lastErr, &statusErr) &&
+			(statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
+			return lastErr
+		}
+		if attempt < keyReportAttempts {
+			time.Sleep(keyReportRetryDelay)
+		}
+	}
+	return lastErr
+}
+
+func putHostKey(relay, token, hostID string, body []byte) error {
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/api/hosts/%s/key", relay, url.PathEscape(hostID)), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second, Transport: createRelayTransport()}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	debugLog("[key] report failed: status=%d, body=%s", resp.StatusCode, string(bodyBytes))
+	return &httpStatusError{Op: "report key", Status: resp.StatusCode}
+}
+
+// randRead is a seam so tests can exercise key-generation failures.
+var randRead = rand.Read
+
+func generateEncryptionKey() (string, error) {
 	key := make([]byte, 32)
-	rand.Read(key)
-	return hex.EncodeToString(key)
+	if _, err := randRead(key); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(key), nil
 }
 
 func encrypt(plaintext []byte, keyHex string) ([]byte, error) {

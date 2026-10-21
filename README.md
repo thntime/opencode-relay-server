@@ -94,7 +94,7 @@ The tunnel client will:
 ## Tunnel Client Usage
 
 ```bash
-# Start tunnel (default)
+# First run: logs in, registers the host, and starts the tunnel
 opencode-tunnel
 
 # Start with custom port
@@ -103,12 +103,48 @@ opencode-tunnel -port 8080
 # Show status
 opencode-tunnel status
 
-# Logout and clear credentials  
+# Logout and clear credentials
 opencode-tunnel logout
 
 # Help
 opencode-tunnel help
 ```
+
+首次运行会登录并注册主机，不再扫码配对：`tunnel-client` 用 `--token`（或
+`OPENCODE_RELAY_TOKEN`、已保存的 `auth.json`、`--email/--password` 登录）取得凭据，
+调用 `POST /api/devices` 注册主机并把身份写入 `device.json`。E2E 密钥不再放进二维码，
+而是用口令包裹后上报给 Relay（见下方 `--passphrase`）。
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-relay, --relay <url>` | Relay server URL (default: `https://opencode-relay.azurewebsites.net`) |
+| `-port, --port <port>` | Local OpenCode port (default: `4096`, or `opencode.json`'s `port`) |
+| `--name <name>` | Host display name (default: OS hostname) |
+| `--token <token>` | Relay API token (overrides saved credentials) |
+| `--email <email>` | Account email for login |
+| `--password <pass>` | Account password for login |
+| `--passphrase <pass>` | E2E key passphrase, used to wrap the host key before reporting it (never stored) |
+| `--rewrap` | Re-wrap the E2E host key with a new passphrase |
+| `--reset` | Discard the local identity and register a new host |
+| `--attach` | Reuse an already running `opencode serve` on `--port`; the client only probes the port (2s timeout) and fails with a hint instead of spawning OpenCode |
+| `--install` | Validate identity + wrapped key, then install the OS autostart entry and exit (does not start the tunnel) |
+
+### `--install` notes
+
+`--install` only configures autostart; it requires registration and key wrapping to
+succeed first:
+
+- If `device.json` is missing, has no `Host ID`, or has no wrapped key, the client
+  runs the normal `resolveAuth → ensureHost → prepareHostKey` flow in the foreground
+  before writing the launchd/systemd/Task Scheduler entry.
+- Without a passphrase (`--passphrase`, `OPENCODE_TUNNEL_PASSPHRASE`, or an
+  interactive prompt) and without a TTY, `--install` fails with a non-zero exit
+  status instead of silently installing a host that cannot report its E2E key.
+- Normal `start` runs without a passphrase still work, but skip the E2E key report
+  and print a warning (`未提供 E2E 口令…跳过密钥上报；隧道仍可建立`); the tunnel itself
+  is established unencrypted end-to-end until a key is reported.
 
 ### Configuration Files
 
@@ -117,7 +153,7 @@ Located in `~/.opencode-tunnel/`:
 | File | Purpose |
 |------|---------|
 | `auth.json` | Login credentials (JWT token, email) |
-| `device.json` | Device pairing info (subdomain, auth, encryption key) |
+| `device.json` | Host identity (host ID, subdomain, auth) and wrapped E2E key material |
 | `opencode.json` | OpenCode auto-start config |
 
 ## Self-Hosting the Relay Server
