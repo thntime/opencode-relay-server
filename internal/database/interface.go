@@ -27,6 +27,10 @@ type Database interface {
 	MarkDeviceOffline(id int64) error
 	MarkAllDevicesOffline() (int64, error)
 
+	// Host key material (end-to-end encryption)
+	SetDeviceKeyMaterial(deviceID int64, keyWrapped, keySalt, keyKdf string) error
+	GetDeviceKeyMaterial(deviceID int64) (keyWrapped, keySalt, keyKdf string, err error)
+
 	// Verification code operations
 	CreateVerificationCode(email, code string, expiresAt time.Time) error
 	GetValidVerificationCode(email, code string) (bool, error)

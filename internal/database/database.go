@@ -76,6 +76,9 @@ func migrate(db *sql.DB) error {
 		subdomain TEXT UNIQUE NOT NULL,
 		auth_user TEXT NOT NULL DEFAULT '',
 		auth_password TEXT NOT NULL DEFAULT '',
+		key_wrapped TEXT NOT NULL DEFAULT '',
+		key_salt TEXT NOT NULL DEFAULT '',
+		key_kdf TEXT NOT NULL DEFAULT '',
 		online BOOLEAN DEFAULT FALSE,
 		last_seen DATETIME,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -119,6 +122,9 @@ func migrate(db *sql.DB) error {
 	migrations := []string{
 		`ALTER TABLE devices ADD COLUMN auth_user TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE devices ADD COLUMN auth_password TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE devices ADD COLUMN key_wrapped TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE devices ADD COLUMN key_salt TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE devices ADD COLUMN key_kdf TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, m := range migrations {
 		// Ignore errors (column may already exist)

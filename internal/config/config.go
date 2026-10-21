@@ -17,6 +17,7 @@ type Config struct {
 	SingleUserMode bool
 	AdminEmail     string
 	AdminPassword  string
+	LegacyProxy    bool
 }
 
 func Load() *Config {
@@ -33,6 +34,7 @@ func Load() *Config {
 		SingleUserMode: getEnv("SINGLE_USER_MODE", "") == "true",
 		AdminEmail:     getEnv("ADMIN_EMAIL", ""),
 		AdminPassword:  getEnv("ADMIN_PASSWORD", ""),
+		LegacyProxy:    getEnv("RELAY_LEGACY_PROXY", "") == "true",
 	}
 }
 

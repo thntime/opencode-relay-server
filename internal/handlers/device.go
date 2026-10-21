@@ -29,8 +29,7 @@ func (h *DeviceHandler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Name == "" {
-		writeError(w, "device name is required", http.StatusBadRequest)
-		return
+		req.Name = "OpenCode Host"
 	}
 
 	device, err := h.deviceService.Register(userID, req.Name)

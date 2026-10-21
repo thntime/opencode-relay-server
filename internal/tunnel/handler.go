@@ -11,11 +11,12 @@ import (
 )
 
 type Handler struct {
-	manager *Manager
-	db      database.Database
+	manager     *Manager
+	db          database.Database
+	legacyProxy bool
 }
 
-func NewHandler(manager *Manager, db database.Database) *Handler {
+func NewHandler(manager *Manager, db database.Database, legacyProxy bool) *Handler {
 	manager.SetCallbacks(
 		func(subdomain string) {
 			start := time.Now()
@@ -46,8 +47,9 @@ func NewHandler(manager *Manager, db database.Database) *Handler {
 	)
 
 	return &Handler{
-		manager: manager,
-		db:      db,
+		manager:     manager,
+		db:          db,
+		legacyProxy: legacyProxy,
 	}
 }
 
@@ -116,6 +118,13 @@ func (h *Handler) HandleEventConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
+	if !h.legacyProxy {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGone)
+		w.Write([]byte(`{"error":"legacy_proxy_disabled","message":"/proxy/ is disabled; use /relay/{hostId}/<path> instead"}`))
+		return
+	}
+
 	path := r.URL.Path
 	parts := strings.SplitN(strings.TrimPrefix(path, "/proxy/"), "/", 2)
 	if len(parts) < 1 || parts[0] == "" {
@@ -131,24 +140,33 @@ func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[proxy] Incoming request: %s %s -> subdomain=%s, targetPath=%s", r.Method, path, subdomain, targetPath)
 
-	if !h.manager.IsConnected(subdomain) {
-		log.Printf("[proxy] Device not connected: %s", subdomain)
+	forwardHTTP(w, r, h.manager, subdomain, targetPath)
+}
+
+// forwardHTTP sends r to hostID's tunnel at targetPath and writes the tunnel
+// response back. Relay credentials and client-session headers (Authorization,
+// Cookie, X-Forwarded-*, X-Real-IP) are never forwarded to the host's local
+// OpenCode server.
+func forwardHTTP(w http.ResponseWriter, r *http.Request, manager *Manager, hostID, targetPath string) {
+	if !manager.IsConnected(hostID) {
+		log.Printf("[forward] Device not connected: %s", hostID)
 		http.Error(w, "device not connected", http.StatusServiceUnavailable)
 		return
 	}
 
 	body, err := ReadRequestBody(r)
 	if err != nil {
-		log.Printf("[proxy] Failed to read request body: %v", err)
+		log.Printf("[forward] Failed to read request body: %v", err)
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
 		return
 	}
 
 	headers := make(map[string]string)
 	for key := range r.Header {
-		if !isHopByHopHeader(key) {
-			headers[key] = r.Header.Get(key)
+		if isHopByHopHeader(key) || isRelayCredentialHeader(key) {
+			continue
 		}
+		headers[key] = r.Header.Get(key)
 	}
 
 	if r.URL.RawQuery != "" {
@@ -163,11 +181,11 @@ func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		Body:    body,
 	}
 
-	log.Printf("[proxy] Forwarding request ID=%s to tunnel", tunnelReq.ID)
+	log.Printf("[forward] Forwarding request ID=%s to tunnel", tunnelReq.ID)
 
-	resp, err := h.manager.ForwardRequest(subdomain, tunnelReq)
+	resp, err := manager.ForwardRequest(hostID, tunnelReq)
 	if err != nil {
-		log.Printf("[proxy] ForwardRequest failed: %v", err)
+		log.Printf("[forward] ForwardRequest failed: %v", err)
 		if err == ErrTunnelNotFound {
 			http.Error(w, "device not connected", http.StatusServiceUnavailable)
 		} else if err == ErrTunnelTimeout {
@@ -178,7 +196,7 @@ func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[proxy] Got response: StatusCode=%d, BodyLen=%d, Headers=%v", resp.StatusCode, len(resp.Body), resp.Headers)
+	log.Printf("[forward] Got response: StatusCode=%d, BodyLen=%d, Headers=%v", resp.StatusCode, len(resp.Body), resp.Headers)
 
 	for key, value := range resp.Headers {
 		w.Header().Set(key, value)
@@ -188,13 +206,13 @@ func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	if len(resp.Body) > 0 {
 		n, err := w.Write(resp.Body)
 		if err != nil {
-			log.Printf("[proxy] Failed to write response body: %v", err)
+			log.Printf("[forward] Failed to write response body: %v", err)
 		} else {
-			log.Printf("[proxy] Wrote %d bytes to response", n)
+			log.Printf("[forward] Wrote %d bytes to response", n)
 		}
 	}
 
-	log.Printf("[proxy] Request completed successfully")
+	log.Printf("[forward] Request completed successfully")
 }
 
 var hopByHopHeaders = map[string]bool{
@@ -210,6 +228,15 @@ var hopByHopHeaders = map[string]bool{
 
 func isHopByHopHeader(header string) bool {
 	return hopByHopHeaders[header]
+}
+
+// isRelayCredentialHeader reports headers that belong to the relay hop or to
+// the client's own browser session and must not reach the host.
+func isRelayCredentialHeader(header string) bool {
+	return strings.EqualFold(header, "Authorization") ||
+		strings.EqualFold(header, "Cookie") ||
+		strings.EqualFold(header, "X-Real-IP") ||
+		strings.HasPrefix(strings.ToLower(header), "x-forwarded-")
 }
 
 type DeviceVerifyRequest struct {

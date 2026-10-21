@@ -19,6 +19,8 @@ var (
 	ErrEmailExists        = errors.New("email already exists")
 	ErrUserNotFound       = errors.New("user not found")
 	ErrInvalidCode        = errors.New("invalid or expired verification code")
+	ErrHostNotFound       = errors.New("host not found")
+	ErrHostForbidden      = errors.New("host forbidden")
 )
 
 type AuthService struct {
@@ -171,7 +173,7 @@ func (s *AuthService) generateToken(userID int64) (string, error) {
 }
 
 func GenerateSubdomain() string {
-	bytes := make([]byte, 4)
+	bytes := make([]byte, 16)
 	rand.Read(bytes)
 	return hex.EncodeToString(bytes)
 }

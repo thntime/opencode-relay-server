@@ -151,6 +151,7 @@ PORT=8080 JWT_SECRET=your-secret ./server
 | `JWT_SECRET` | (required) | Secret for JWT signing |
 | `DATABASE_PATH` | `./data/relay.db` | SQLite database path |
 | `SINGLE_USER_MODE` | `false` | Skip email verification |
+| `RELAY_LEGACY_PROXY` | `false` | Re-enable the deprecated, unauthenticated `/proxy/*` route |
 
 ### Deploy to fly.io
 
@@ -184,10 +185,21 @@ opencode-tunnel -relay https://your-relay.fly.dev
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/devices` | List user's devices |
-| POST | `/api/devices` | Register new device |
+| POST | `/api/devices` | Register new device (`name` optional, defaults to `OpenCode Host`) |
 | GET | `/api/devices/{id}` | Get device details |
 | PUT | `/api/devices/{id}` | Update device |
 | DELETE | `/api/devices/{id}` | Delete device |
+
+### Hosts
+
+Hosts are the user's machines. `id` is the stable host identifier (the device's `subdomain`).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/hosts` | List the caller's hosts (`id`, `name`, `online`, `last_seen`) |
+| GET | `/api/hosts/{hostId}/key` | Fetch the wrapped E2E key material for a host |
+
+Both require `Authorization: Bearer <jwt>` and only return hosts owned by that user.
 
 ### Pairing
 
@@ -203,7 +215,34 @@ opencode-tunnel -relay https://your-relay.fly.dev
 |--------|----------|-------------|
 | GET | `/api/tunnel/{subdomain}` | WebSocket tunnel connection |
 | GET | `/api/events/{subdomain}` | SSE event forwarding |
-| ANY | `/proxy/*` | HTTP proxy to tunnel |
+| ANY | `/proxy/*` | Deprecated HTTP proxy; returns 410 unless `RELAY_LEGACY_PROXY=true` |
+
+### Relay routing
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| ANY | `/relay/{hostId}/{path...}` | Authenticated request forwarding to that host's tunnel |
+
+`/relay/...` requires `Authorization: Bearer <jwt>`, checks that `hostId` belongs to the caller, and returns
+401 (no/invalid token), 403 (someone else's host), 404 (unknown host) or 503 (host offline).
+The `Authorization` header is consumed by the relay and is not forwarded to the host.
+
+The relay also strips `Cookie`, `X-Real-IP` and every `X-Forwarded-*` header, so the host's local OpenCode
+server receives requests carrying no credentials whatsoever. A valid relay JWT is therefore equivalent to
+full access to every host of its user. JWTs are valid for 30 days and there is no revocation mechanism: if
+one leaks, rotating `JWT_SECRET` is the only remediation.
+
+Streaming responses (SSE) and WebSocket forwarding (terminal PTY) are not implemented yet; the tunnel
+protocol is request/response only, so SSE clients fall back to polling until that work lands.
+
+### Migrating from `/proxy/`
+
+1. Deploy the relay with the new schema (three nullable key columns are added automatically) and the `/relay/` routes.
+2. Upgrade tunnel clients; they keep working over `/api/tunnel/{subdomain}`.
+3. Point mobile clients at `/relay/{hostId}/...`.
+4. Only if a legacy client still needs `/proxy/`, set `RELAY_LEGACY_PROXY=true` for one release. Legacy mode still strips `Authorization`, `Cookie`, `X-Real-IP` and `X-Forwarded-*` before forwarding.
+
+Rollback only needs the route registration reverted; no data migration is destructive.
 
 ## Development
 

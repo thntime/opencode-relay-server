@@ -75,8 +75,8 @@ func TestDeviceService_Register(t *testing.T) {
 				t.Errorf("Register() name = %v, want %v", device.Name, tt.deviceName)
 			}
 
-			if len(device.Subdomain) != 8 {
-				t.Errorf("Register() subdomain length = %d, want 8", len(device.Subdomain))
+			if len(device.Subdomain) != 32 {
+				t.Errorf("Register() subdomain length = %d, want 32", len(device.Subdomain))
 			}
 
 			if device.UserID != tt.userID {

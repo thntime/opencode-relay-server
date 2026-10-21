@@ -230,8 +230,8 @@ func TestGenerateSubdomain(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		subdomain := services.GenerateSubdomain()
 
-		if len(subdomain) != 8 {
-			t.Errorf("GenerateSubdomain() length = %d, want 8", len(subdomain))
+		if len(subdomain) != 32 {
+			t.Errorf("GenerateSubdomain() length = %d, want 32", len(subdomain))
 		}
 
 		if subdomains[subdomain] {

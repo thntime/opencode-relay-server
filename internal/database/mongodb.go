@@ -341,6 +341,47 @@ func (m *MongoDB) MarkAllDevicesOffline() (int64, error) {
 	return result.ModifiedCount, nil
 }
 
+func (m *MongoDB) SetDeviceKeyMaterial(deviceID int64, keyWrapped, keySalt, keyKdf string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	update := bson.M{
+		"$set": bson.M{
+			"key_wrapped": keyWrapped,
+			"key_salt":    keySalt,
+			"key_kdf":     keyKdf,
+			"updated_at":  time.Now(),
+		},
+	}
+
+	_, err := m.devices.UpdateOne(ctx, bson.M{"id": deviceID}, update)
+	return err
+}
+
+func (m *MongoDB) GetDeviceKeyMaterial(deviceID int64) (string, string, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var doc struct {
+		KeyWrapped string `bson:"key_wrapped"`
+		KeySalt    string `bson:"key_salt"`
+		KeyKdf     string `bson:"key_kdf"`
+	}
+	opts := options.FindOne().SetProjection(bson.M{
+		"key_wrapped": 1,
+		"key_salt":    1,
+		"key_kdf":     1,
+	})
+	err := m.devices.FindOne(ctx, bson.M{"id": deviceID}, opts).Decode(&doc)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return "", "", "", sql.ErrNoRows
+		}
+		return "", "", "", err
+	}
+	return doc.KeyWrapped, doc.KeySalt, doc.KeyKdf, nil
+}
+
 func (m *MongoDB) CreateVerificationCode(email, code string, expiresAt time.Time) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

@@ -69,9 +69,9 @@ func (db *DB) GetDeviceByID(id int64) (*models.Device, error) {
 	device := &models.Device{}
 	var lastSeen sql.NullTime
 	err := db.QueryRow(
-		"SELECT id, user_id, name, subdomain, auth_user, auth_password, online, last_seen, created_at, updated_at FROM devices WHERE id = ?",
+		"SELECT id, user_id, name, subdomain, auth_user, auth_password, key_wrapped, key_salt, key_kdf, online, last_seen, created_at, updated_at FROM devices WHERE id = ?",
 		id,
-	).Scan(&device.ID, &device.UserID, &device.Name, &device.Subdomain, &device.AuthUser, &device.AuthPassword, &device.Online, &lastSeen, &device.CreatedAt, &device.UpdatedAt)
+	).Scan(&device.ID, &device.UserID, &device.Name, &device.Subdomain, &device.AuthUser, &device.AuthPassword, &device.KeyWrapped, &device.KeySalt, &device.KeyKdf, &device.Online, &lastSeen, &device.CreatedAt, &device.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -85,9 +85,9 @@ func (db *DB) GetDeviceBySubdomain(subdomain string) (*models.Device, error) {
 	device := &models.Device{}
 	var lastSeen sql.NullTime
 	err := db.QueryRow(
-		"SELECT id, user_id, name, subdomain, auth_user, auth_password, online, last_seen, created_at, updated_at FROM devices WHERE subdomain = ?",
+		"SELECT id, user_id, name, subdomain, auth_user, auth_password, key_wrapped, key_salt, key_kdf, online, last_seen, created_at, updated_at FROM devices WHERE subdomain = ?",
 		subdomain,
-	).Scan(&device.ID, &device.UserID, &device.Name, &device.Subdomain, &device.AuthUser, &device.AuthPassword, &device.Online, &lastSeen, &device.CreatedAt, &device.UpdatedAt)
+	).Scan(&device.ID, &device.UserID, &device.Name, &device.Subdomain, &device.AuthUser, &device.AuthPassword, &device.KeyWrapped, &device.KeySalt, &device.KeyKdf, &device.Online, &lastSeen, &device.CreatedAt, &device.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +99,7 @@ func (db *DB) GetDeviceBySubdomain(subdomain string) (*models.Device, error) {
 
 func (db *DB) GetDevicesByUserID(userID int64) ([]*models.Device, error) {
 	rows, err := db.Query(
-		"SELECT id, user_id, name, subdomain, auth_user, auth_password, online, last_seen, created_at, updated_at FROM devices WHERE user_id = ? ORDER BY created_at DESC",
+		"SELECT id, user_id, name, subdomain, auth_user, auth_password, key_wrapped, key_salt, key_kdf, online, last_seen, created_at, updated_at FROM devices WHERE user_id = ? ORDER BY created_at DESC",
 		userID,
 	)
 	if err != nil {
@@ -111,7 +111,7 @@ func (db *DB) GetDevicesByUserID(userID int64) ([]*models.Device, error) {
 	for rows.Next() {
 		device := &models.Device{}
 		var lastSeen sql.NullTime
-		if err := rows.Scan(&device.ID, &device.UserID, &device.Name, &device.Subdomain, &device.AuthUser, &device.AuthPassword, &device.Online, &lastSeen, &device.CreatedAt, &device.UpdatedAt); err != nil {
+		if err := rows.Scan(&device.ID, &device.UserID, &device.Name, &device.Subdomain, &device.AuthUser, &device.AuthPassword, &device.KeyWrapped, &device.KeySalt, &device.KeyKdf, &device.Online, &lastSeen, &device.CreatedAt, &device.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if lastSeen.Valid {
@@ -169,6 +169,26 @@ func (db *DB) MarkAllDevicesOffline() (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+func (db *DB) SetDeviceKeyMaterial(deviceID int64, keyWrapped, keySalt, keyKdf string) error {
+	_, err := db.Exec(
+		"UPDATE devices SET key_wrapped = ?, key_salt = ?, key_kdf = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		keyWrapped, keySalt, keyKdf, deviceID,
+	)
+	return err
+}
+
+func (db *DB) GetDeviceKeyMaterial(deviceID int64) (string, string, string, error) {
+	var keyWrapped, keySalt, keyKdf string
+	err := db.QueryRow(
+		"SELECT key_wrapped, key_salt, key_kdf FROM devices WHERE id = ?",
+		deviceID,
+	).Scan(&keyWrapped, &keySalt, &keyKdf)
+	if err != nil {
+		return "", "", "", err
+	}
+	return keyWrapped, keySalt, keyKdf, nil
 }
 
 func (db *DB) CreateVerificationCode(email, code string, expiresAt time.Time) error {

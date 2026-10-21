@@ -58,10 +58,12 @@ func main() {
 	pairingService := services.NewPairingService(db, cfg)
 
 	tunnelManager := tunnel.NewManager()
-	tunnelHandler := tunnel.NewHandler(tunnelManager, db)
+	tunnelHandler := tunnel.NewHandler(tunnelManager, db, cfg.LegacyProxy)
+	relayHandler := tunnel.NewRelayHandler(tunnelManager, deviceService)
 
 	authHandler := handlers.NewAuthHandler(authService, emailService)
 	deviceHandler := handlers.NewDeviceHandler(deviceService)
+	hostHandler := handlers.NewHostHandler(deviceService)
 	pairingHandler := handlers.NewPairingHandler(pairingService)
 
 	authMiddleware := middleware.Auth(authService)
@@ -82,6 +84,10 @@ func main() {
 	mux.Handle("DELETE /api/devices/{id}", authMiddleware(http.HandlerFunc(deviceHandler.Delete)))
 	mux.Handle("GET /api/devices/{id}/frpc-config", authMiddleware(http.HandlerFunc(deviceHandler.GetFrpcConfig)))
 
+	mux.Handle("GET /api/hosts", authMiddleware(http.HandlerFunc(hostHandler.List)))
+	mux.Handle("GET /api/hosts/{hostId}/key", authMiddleware(http.HandlerFunc(hostHandler.GetKey)))
+	mux.Handle("PUT /api/hosts/{hostId}/key", authMiddleware(http.HandlerFunc(hostHandler.PutKey)))
+
 	mux.Handle("POST /api/pairing", authMiddleware(http.HandlerFunc(pairingHandler.Create)))
 	mux.Handle("GET /api/pairing/{id}/status", authMiddleware(http.HandlerFunc(pairingHandler.GetStatus)))
 	mux.Handle("POST /api/pairing/{id}/complete", authMiddleware(http.HandlerFunc(pairingHandler.Complete)))
@@ -89,6 +95,7 @@ func main() {
 	mux.HandleFunc("GET /api/tunnel/{subdomain}", tunnelHandler.HandleTunnelConnect)
 	mux.HandleFunc("GET /api/events/{subdomain}", tunnelHandler.HandleEventConnect)
 	mux.HandleFunc("POST /api/device/verify", tunnelHandler.HandleDeviceVerify)
+	mux.Handle("/relay/", authMiddleware(http.HandlerFunc(relayHandler.HandleRelay)))
 	mux.HandleFunc("/proxy/", tunnelHandler.HandleProxy)
 
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {

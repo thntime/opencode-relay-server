@@ -17,10 +17,22 @@ type Device struct {
 	Subdomain    string    `json:"subdomain" bson:"subdomain"`
 	AuthUser     string    `json:"auth_user" bson:"auth_user"`
 	AuthPassword string    `json:"auth_password" bson:"auth_password"`
+	KeyWrapped   string    `json:"-" bson:"key_wrapped"`
+	KeySalt      string    `json:"-" bson:"key_salt"`
+	KeyKdf       string    `json:"-" bson:"key_kdf"`
 	Online       bool      `json:"online" bson:"online"`
 	LastSeen     time.Time `json:"last_seen" bson:"last_seen"`
 	CreatedAt    time.Time `json:"created_at" bson:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at" bson:"updated_at"`
+}
+
+// HostDTO is the public view of a device as a persistent host.
+// ID is Device.Subdomain.
+type HostDTO struct {
+	ID       string    `json:"id"`
+	Name     string    `json:"name"`
+	Online   bool      `json:"online"`
+	LastSeen time.Time `json:"last_seen"`
 }
 
 type SendVerificationRequest struct {
