@@ -1,0 +1,11 @@
+.git
+.github
+data
+npm
+deploy
+test-ws
+*.exe
+server
+opencode-relay-server-*
+tunnel-client
+tunnel-client-*
