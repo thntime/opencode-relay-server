@@ -98,6 +98,12 @@ func main() {
 	mux.Handle("/relay/", authMiddleware(http.HandlerFunc(relayHandler.HandleRelay)))
 	mux.HandleFunc("/proxy/", tunnelHandler.HandleProxy)
 
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write([]byte(indexHTML))
+	})
+
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
