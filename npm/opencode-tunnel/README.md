@@ -37,6 +37,10 @@ npm config get allow-scripts                          # 查看当前配置
 > `npm install-scripts approve @thntime/opencode-tunnel` 只适用于**项目内**安装（需要项目里的
 > `package.json`）；对全局安装（`-g`）使用会报 `EGLOBAL: npm install-scripts does not work for
 > global installs`，不要混用。
+>
+> `npm config set allow-scripts` 会**整体替换**已有清单。如果之前放行过别的包（例如
+> `allow-scripts=@opencode/cli`），请用逗号追加，避免把它们的放行一起清掉：
+> `npm config set allow-scripts=@opencode/cli,@thntime/opencode-tunnel --location=user`。
 
 不放行也**不会**导致安装失败：包本身仍会安装成功，首次运行 `opencode-tunnel` 时会自动补下载
 二进制（同样经过 `SHA256SUMS` 校验），区别只是下载时机从安装时推迟到首次运行。
@@ -187,6 +191,11 @@ npm config get allow-scripts                          # show the current setting
 > `npm install-scripts approve @thntime/opencode-tunnel` only works for **project-local** installs
 > (it needs the project's `package.json`). With `-g` npm 12 fails with
 > `EGLOBAL: npm install-scripts does not work for global installs`, so do not use it there.
+>
+> `npm config set allow-scripts` **replaces** the existing list. If other packages were already
+> allowed (for example `allow-scripts=@opencode/cli`), append with a comma so their approval is
+> not dropped:
+> `npm config set allow-scripts=@opencode/cli,@thntime/opencode-tunnel --location=user`.
 
 Not allowing it does **not** break the install: the package still installs, and the first
 `opencode-tunnel` run downloads the binary (verified against `SHA256SUMS` as well). The only

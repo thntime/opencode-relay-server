@@ -79,7 +79,9 @@ jobs:
       # and Windows binaries are cross-compiled, so running them here would fail
       # with an exec-format error instead of a version check.
       - name: Smoke test binary version
-        if: matrix.goos == 'linux'
+        # Only the runner's own architecture can execute here: linux/arm64 is a
+        # cross-compiled artifact on an x86_64 runner.
+        if: matrix.suffix == 'linux-amd64'
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           BIN="tunnel-client-${{ matrix.suffix }}"

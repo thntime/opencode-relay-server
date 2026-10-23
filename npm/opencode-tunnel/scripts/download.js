@@ -68,9 +68,11 @@ function createProxyAgent(targetUrl, env) {
   try {
     proxyUrl = new URL(candidate);
   } catch (err) {
+    warnProxy(`Ignoring invalid proxy value: ${raw}`);
     return null;
   }
   if (!/^https?:$/.test(proxyUrl.protocol) || !proxyUrl.hostname) {
+    warnProxy(`Ignoring unsupported proxy URL (only http/https proxies work): ${redactUrl(candidate)}`);
     return null;
   }
 
@@ -79,8 +81,17 @@ function createProxyAgent(targetUrl, env) {
     const { HttpsProxyAgent } = require('https-proxy-agent');
     return new HttpsProxyAgent(proxyUrl.toString());
   } catch (err) {
+    warnProxy('Proxy is configured but https-proxy-agent is missing; falling back to a direct connection');
     return null;
   }
+}
+
+let proxyWarningShown = false;
+
+function warnProxy(message) {
+  if (proxyWarningShown) return;
+  proxyWarningShown = true;
+  process.stderr.write(`[opencode-tunnel] ${message}\n`);
 }
 
 function redactUrl(rawUrl) {

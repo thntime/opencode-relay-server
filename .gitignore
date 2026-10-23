@@ -17,3 +17,9 @@ Thumbs.db
 *.db
 tunnel-client-*
 relay-server
+
+# Local env
+.env
+
+# Node dependencies
+node_modules/

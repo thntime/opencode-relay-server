@@ -23,35 +23,38 @@ async function main() {
     console.error(
       'The postinstall download did not run (npm blocks install scripts by default); downloading now on first run...'
     );
+  }
 
-    let result;
-    try {
-      result = await ensureBinary();
-    } catch (err) {
-      console.error(`Download failed: ${err && err.message ? err.message : err}`);
-      console.error('Try reinstalling: npm install -g @thntime/opencode-tunnel');
-      process.exit(1);
-    }
+  // ensureBinary also validates an existing file (size and executable magic),
+  // so a truncated leftover from an interrupted install is re-downloaded here
+  // instead of failing later with "Exec format error".
+  let result;
+  try {
+    result = await ensureBinary();
+  } catch (err) {
+    console.error(`Download failed: ${err && err.message ? err.message : err}`);
+    console.error('Try reinstalling: npm install -g @thntime/opencode-tunnel');
+    process.exit(1);
+  }
 
-    if (!result.ok) {
-      console.error(`Download failed (${result.reason}).`);
-      if (result.error && result.error.message) {
-        console.error(`Reason: ${result.error.message}`);
-      }
-      if (result.url) {
-        console.error(`URL: ${redactUrl(result.url)}`);
-      }
-      printManualInstructions(result);
-      console.error('');
-      console.error('Try reinstalling: npm install -g @thntime/opencode-tunnel');
-      process.exit(1);
+  if (!result.ok) {
+    console.error(`Download failed (${result.reason}).`);
+    if (result.error && result.error.message) {
+      console.error(`Reason: ${result.error.message}`);
     }
+    if (result.url) {
+      console.error(`URL: ${redactUrl(result.url)}`);
+    }
+    printManualInstructions(result);
+    console.error('');
+    console.error('Try reinstalling: npm install -g @thntime/opencode-tunnel');
+    process.exit(1);
+  }
 
-    if (!fs.existsSync(binaryPath)) {
-      console.error(`Binary still not found: ${binaryPath}`);
-      console.error('Try reinstalling: npm install -g @thntime/opencode-tunnel');
-      process.exit(1);
-    }
+  if (!fs.existsSync(binaryPath)) {
+    console.error(`Binary still not found: ${binaryPath}`);
+    console.error('Try reinstalling: npm install -g @thntime/opencode-tunnel');
+    process.exit(1);
   }
 
   if (process.platform !== 'win32') {
