@@ -5,6 +5,12 @@
   "bin": {
     "opencode-tunnel": "./bin/cli.js"
   },
+  "files": [
+    "bin/cli.js",
+    "scripts/download.js",
+    "scripts/postinstall.js",
+    "README.md"
+  ],
   "scripts": {
     "postinstall": "node scripts/postinstall.js"
   },
@@ -37,5 +43,8 @@
   "cpu": [
     "x64",
     "arm64"
-  ]
+  ],
+  "dependencies": {
+    "https-proxy-agent": "^7.0.6"
+  }
 }

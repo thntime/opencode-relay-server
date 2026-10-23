@@ -2582,3 +2582,92 @@ func TestNewLocalRequestAppliesLocalAuth(t *testing.T) {
 		t.Fatalf("Authorization = %q, want %q", got, want)
 	}
 }
+
+// TestDispatchSafeBranches covers the dispatch branches that return without
+// starting a tunnel. The implicit-start (-relay ...) and known subcommand
+// branches intentionally call cmdStart/cmdStatus/... which would start a real
+// tunnel or hit the network, so they are not exercised here; their parsing is
+// covered by TestParseStartArgs and the command-level tests.
+func TestDispatchSafeBranches(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantCode   int
+		wantOutput []string
+	}{
+		{name: "help", args: []string{"help"}, wantCode: 0, wantOutput: []string{"Usage:", "version"}},
+		{name: "short help", args: []string{"-h"}, wantCode: 0, wantOutput: []string{"Usage:"}},
+		{name: "long help", args: []string{"--help"}, wantCode: 0, wantOutput: []string{"Usage:"}},
+		{name: "version", args: []string{"version"}, wantCode: 0, wantOutput: []string{"tunnel-client"}},
+		{name: "short version", args: []string{"-v"}, wantCode: 0, wantOutput: []string{"tunnel-client"}},
+		{name: "long version", args: []string{"--version"}, wantCode: 0, wantOutput: []string{"tunnel-client"}},
+		{name: "unknown command", args: []string{"bogus"}, wantCode: 1, wantOutput: []string{"Unknown command: bogus", "Usage:"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var code int
+			out := captureStdout(t, func() { code = dispatch(tc.args) })
+			if code != tc.wantCode {
+				t.Fatalf("dispatch(%v) = %d, want %d; output:\n%s", tc.args, code, tc.wantCode, out)
+			}
+			for _, want := range tc.wantOutput {
+				if !strings.Contains(out, want) {
+					t.Fatalf("dispatch(%v) output missing %q:\n%s", tc.args, want, out)
+				}
+			}
+		})
+	}
+}
+
+func TestPrintVersionUsesInjectedBuildInfo(t *testing.T) {
+	oldVersion, oldTime, oldCommit := buildVersion, buildTime, buildCommit
+	buildVersion, buildTime, buildCommit = "1.2.3", "2026-10-23T00:00:00Z", "abc1234"
+	t.Cleanup(func() {
+		buildVersion, buildTime, buildCommit = oldVersion, oldTime, oldCommit
+	})
+
+	out := captureStdout(t, printVersion)
+	want := "tunnel-client 1.2.3 (built: 2026-10-23T00:00:00Z, commit: abc1234)"
+	if !strings.Contains(out, want) {
+		t.Fatalf("printVersion output %q does not contain %q", out, want)
+	}
+}
+
+// TestDispatchRoutesToStart covers the ISSUE-01 regression point: a leading
+// flag (no "start" token) and an explicit "start" must both reach the start
+// path exactly once, while help/version must not start anything.
+func TestDispatchRoutesToStart(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantCode int
+		wantCall int
+	}{
+		{name: "implicit start with relay flag", args: []string{"-relay", "https://example.test"}, wantCode: 0, wantCall: 1},
+		{name: "implicit start with port flag", args: []string{"-port", "4096"}, wantCode: 0, wantCall: 1},
+		{name: "explicit start", args: []string{"start", "-port", "4096"}, wantCode: 0, wantCall: 1},
+		{name: "help does not start", args: []string{"--help"}, wantCode: 0, wantCall: 0},
+		{name: "version does not start", args: []string{"--version"}, wantCode: 0, wantCall: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			old := startCommand
+			calls := 0
+			startCommand = func() { calls++ }
+			t.Cleanup(func() { startCommand = old })
+
+			code := captureStdout(t, func() {
+				got := dispatch(tc.args)
+				if got != tc.wantCode {
+					t.Fatalf("dispatch(%v) = %d, want %d", tc.args, got, tc.wantCode)
+				}
+			})
+			_ = code
+			if calls != tc.wantCall {
+				t.Fatalf("dispatch(%v) called startCommand %d time(s), want %d", tc.args, calls, tc.wantCall)
+			}
+		})
+	}
+}

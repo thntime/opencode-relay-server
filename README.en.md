@@ -161,11 +161,11 @@ The client also:
 ## Tunnel Client 使用 / Tunnel Client Usage
 
 ```bash
-# Start the tunnel (default command)
-opencode-tunnel
+# Omit start (the default command)
+opencode-tunnel -relay https://your-relay.example.com -port 4096
 
-# Use a custom local OpenCode port
-opencode-tunnel -port 4096
+# Explicit start (exactly equivalent to the above)
+opencode-tunnel start -relay https://your-relay.example.com -port 4096
 
 # Show status
 opencode-tunnel status
@@ -176,9 +176,18 @@ opencode-tunnel discover
 # Log out and clear credentials
 opencode-tunnel logout
 
+# Print the version
+opencode-tunnel --version
+
 # Help
 opencode-tunnel help
 ```
+
+> `opencode-tunnel` is the command name installed by npm (`npm install -g @thntime/opencode-tunnel`).
+> When you build from source the binary is called `tunnel-client`; its flags and subcommands are
+> identical, so only the command name changes.
+
+Supported flags: `-port`, `-relay`, `--name`, `--token`, `--email`, `--password`, `--reset`, `--attach`, `--install`, `--passphrase`, `--rewrap` (see the options table below). When `start` is omitted, the first argument beginning with `-` is treated as a start flag; unknown tokens are ignored, so **a misspelled flag does not produce an error** — it is silently skipped. Use the table below as the reference.
 
 > `opencode-tunnel pair` is kept for compatibility with the legacy pairing flow. A normal `start` registers the host automatically; no QR scan is required.
 

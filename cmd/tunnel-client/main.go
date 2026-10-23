@@ -501,20 +501,47 @@ func runMenu() {
 	}
 }
 
+// startCommand is a seam for tests: dispatch must route implicit-start calls
+// (e.g. "tunnel-client -relay ...") into the start path without actually
+// opening a tunnel.
+var startCommand = cmdStart
+
 func main() {
 	initDebugLogger()
-	if len(os.Args) < 2 {
+	os.Exit(dispatch(os.Args[1:]))
+}
+
+// dispatch routes the CLI arguments and returns the process exit code. The
+// order matters: help/version must be handled before the "-" prefix check,
+// otherwise -h/--help/-v/--version would be treated as start flags. Any other
+// leading dash is an implicit start (e.g. tunnel-client -relay ...).
+func dispatch(args []string) int {
+	if len(args) == 0 {
 		if term.IsTerminal(int(os.Stdin.Fd())) {
 			runMenu()
 		} else {
-			cmdStart()
+			startCommand()
 		}
-		return
+		return 0
 	}
 
-	switch os.Args[1] {
+	switch args[0] {
+	case "help", "-h", "--help":
+		printUsage()
+		return 0
+	case "version", "-v", "--version":
+		printVersion()
+		return 0
+	}
+
+	if strings.HasPrefix(args[0], "-") {
+		startCommand()
+		return 0
+	}
+
+	switch args[0] {
 	case "start":
-		cmdStart()
+		startCommand()
 	case "status":
 		cmdStatus()
 	case "logout":
@@ -523,13 +550,16 @@ func main() {
 		cmdPair()
 	case "discover":
 		cmdDiscover()
-	case "help", "-h", "--help":
-		printUsage()
 	default:
-		fmt.Printf("Unknown command: %s\n", os.Args[1])
+		fmt.Printf("Unknown command: %s\n", args[0])
 		printUsage()
-		os.Exit(1)
+		return 1
 	}
+	return 0
+}
+
+func printVersion() {
+	fmt.Printf("tunnel-client %s (built: %s, commit: %s)\n", buildVersion, buildTime, buildCommit)
 }
 
 func printUsage() {
@@ -544,6 +574,10 @@ Commands:
   status    Show current status
   discover  Discover running opencode instances
   logout    Logout and clear credentials
+  version   Print version information
+
+  help, -h, --help        Print this help
+  version, -v, --version  Print version information
 
 Options:
   -port <port>          Local OpenCode port (default: %s)
@@ -703,7 +737,7 @@ var fatalExit = func(format string, v ...interface{}) {
 }
 
 func cmdStart() {
-	fmt.Printf("tunnel-client %s (built: %s, commit: %s)\n", buildVersion, buildTime, buildCommit)
+	printVersion()
 	opts := parseStartArgs(os.Args[1:])
 
 	localPort := opts.Port

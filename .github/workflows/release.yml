@@ -22,6 +22,14 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run npm client tests
+        run: node --test npm/opencode-tunnel/scripts/download.test.js
+
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -55,8 +63,29 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
         run: |
-          go build -o tunnel-client-${{ matrix.suffix }} ./cmd/tunnel-client
+          VERSION="${VERSION#v}"
+          go build -ldflags "-X main.buildVersion=${VERSION} -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.buildCommit=${GITHUB_SHA}" -o tunnel-client-${{ matrix.suffix }} ./cmd/tunnel-client
+
+      # Only Linux artifacts can execute on this ubuntu-latest runner. The macOS
+      # and Windows binaries are cross-compiled, so running them here would fail
+      # with an exec-format error instead of a version check.
+      - name: Smoke test binary version
+        if: matrix.goos == 'linux'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BIN="tunnel-client-${{ matrix.suffix }}"
+          chmod +x "$BIN"
+          OUTPUT=$(./"$BIN" --version)
+          echo "$OUTPUT"
+          case "$OUTPUT" in
+            *"$VERSION"*) ;;
+            *)
+              echo "::error::$BIN --version did not contain $VERSION"
+              exit 1
+              ;;
+          esac
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

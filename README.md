@@ -161,11 +161,11 @@ opencode-tunnel
 ## Tunnel Client 使用 / Tunnel Client Usage
 
 ```bash
-# 启动隧道（默认命令）
-opencode-tunnel
+# 省略 start（默认命令）
+opencode-tunnel -relay https://your-relay.example.com -port 4096
 
-# 指定本地 OpenCode 端口
-opencode-tunnel -port 4096
+# 显式 start（与上面完全等价）
+opencode-tunnel start -relay https://your-relay.example.com -port 4096
 
 # 查看状态
 opencode-tunnel status
@@ -176,9 +176,17 @@ opencode-tunnel discover
 # 退出登录并清除凭据
 opencode-tunnel logout
 
+# 查看版本
+opencode-tunnel --version
+
 # 查看帮助
 opencode-tunnel help
 ```
+
+> `opencode-tunnel` 是 npm 安装后的命令名（`npm install -g @thntime/opencode-tunnel`）。
+> 从源码构建时二进制名为 `tunnel-client`，参数与子命令完全相同，把命令名替换即可。
+
+受支持的 flag：`-port`、`-relay`、`--name`、`--token`、`--email`、`--password`、`--reset`、`--attach`、`--install`、`--passphrase`、`--rewrap`（说明见下方参数表）。省略 `start` 时，第一个以 `-` 开头的参数会被当作启动参数；未知 token 会被忽略，**flag 拼错不会报错**，只会被静默跳过，因此请以上表为准。
 
 > `opencode-tunnel pair` 仍保留用于兼容旧版配对流程；正常使用 `start` 时会自动注册主机，不需要扫码。
 
