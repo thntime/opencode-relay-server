@@ -2649,6 +2649,8 @@ func TestDispatchRoutesToStart(t *testing.T) {
 		{name: "explicit start", args: []string{"start", "-port", "4096"}, wantCode: 0, wantCall: 1},
 		{name: "help does not start", args: []string{"--help"}, wantCode: 0, wantCall: 0},
 		{name: "version does not start", args: []string{"--version"}, wantCode: 0, wantCall: 0},
+		{name: "single dash version does not start", args: []string{"-version"}, wantCode: 0, wantCall: 0},
+		{name: "single dash help does not start", args: []string{"-help"}, wantCode: 0, wantCall: 0},
 	}
 
 	for _, tc := range tests {

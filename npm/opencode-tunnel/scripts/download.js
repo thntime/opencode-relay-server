@@ -15,16 +15,33 @@ const DEFAULT_DOWNLOAD_BASE = `https://github.com/${REPO}/releases/download`;
 function isNoProxyHost(parsed, env) {
   const raw = env.NO_PROXY || env.no_proxy;
   if (!raw) return false;
-  const host = parsed.hostname.toLowerCase();
+  const host = String(parsed.hostname || '')
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '');
+
   return String(raw)
     .split(/[,\s]+/)
     .filter(Boolean)
     .some((entry) => {
-      const value = entry.trim().toLowerCase();
+      let value = entry.trim().toLowerCase();
       if (!value) return false;
       if (value === '*') return true;
-      const withoutPort = value.includes(':') && !value.startsWith('[') ? value.split(':')[0] : value;
-      const bare = withoutPort.startsWith('.') ? withoutPort.slice(1) : withoutPort;
+
+      value = value.replace(/^[a-z][a-z0-9+.-]*:\/\//, '');
+      if (value.startsWith('[')) {
+        const close = value.indexOf(']');
+        if (close === -1) return false;
+        value = value.slice(1, close);
+      } else if ((value.match(/:/g) || []).length === 1) {
+        value = value.split(':')[0];
+      }
+
+      const bare = value.startsWith('*.')
+        ? value.slice(2)
+        : value.startsWith('.')
+          ? value.slice(1)
+          : value;
+      if (!bare) return false;
       return host === bare || host.endsWith(`.${bare}`);
     });
 }
@@ -44,10 +61,23 @@ function createProxyAgent(targetUrl, env) {
     : env.HTTP_PROXY || env.http_proxy;
   if (!raw) return null;
 
+  // curl accepts "proxy.corp:8080" without a scheme; normalise before parsing
+  // so a scheme-less value cannot silently produce an agent with an empty host.
+  const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+  let proxyUrl;
+  try {
+    proxyUrl = new URL(candidate);
+  } catch (err) {
+    return null;
+  }
+  if (!/^https?:$/.test(proxyUrl.protocol) || !proxyUrl.hostname) {
+    return null;
+  }
+
   try {
     // Loaded lazily so the module still works if the dependency is missing.
     const { HttpsProxyAgent } = require('https-proxy-agent');
-    return new HttpsProxyAgent(raw);
+    return new HttpsProxyAgent(proxyUrl.toString());
   } catch (err) {
     return null;
   }
@@ -98,8 +128,11 @@ const PLATFORM_MAP = {
 const DEFAULT_RETRY_DELAYS = [1000, 2000, 4000];
 const DEFAULT_MAX_ATTEMPTS = 4;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
-const DEFAULT_TOTAL_TIMEOUT_MS = 120000;
+const DEFAULT_TOTAL_TIMEOUT_MS = 300000;
 const MAX_REDIRECTS = 5;
+// Buffered responses (the SHA256SUMS file) are tiny; cap them so a wrong URL
+// cannot stream an arbitrary amount of data into memory.
+const MAX_BUFFER_BYTES = 1024 * 1024;
 
 function buildUrls(options) {
   const opts = options || {};
@@ -154,7 +187,7 @@ function fetchUrl(url, options) {
       totalTimeoutMs > 0
         ? setTimeout(() => {
             fail(
-              Object.assign(new Error(`Download timed out after ${totalTimeoutMs}ms: ${url}`), {
+              Object.assign(new Error(`Download timed out after ${totalTimeoutMs}ms: ${redactUrl(url)}`), {
                 code: 'ETIMEDOUT'
               })
             );
@@ -217,7 +250,7 @@ function fetchUrl(url, options) {
         if (status >= 300 && status < 400 && res.headers.location) {
           res.resume();
           if (redirectsLeft <= 0) {
-            fail(new Error(`Too many redirects while downloading ${url}`));
+            fail(new Error(`Too many redirects while downloading ${redactUrl(url)}`));
             return;
           }
           let nextUrl;
@@ -234,7 +267,7 @@ function fetchUrl(url, options) {
         if (status !== 200) {
           res.resume();
           fail(
-            Object.assign(new Error(`HTTP ${status}: ${targetUrl}`), {
+            Object.assign(new Error(`HTTP ${status}: ${redactUrl(targetUrl)}`), {
               statusCode: status
             })
           );
@@ -243,9 +276,19 @@ function fetchUrl(url, options) {
 
         if (!dest) {
           const chunks = [];
-          res.on('data', (chunk) => chunks.push(chunk));
+          let total = 0;
+          res.on('data', (chunk) => {
+            total += chunk.length;
+            if (total > MAX_BUFFER_BYTES) {
+              res.destroy();
+              fail(new Error(`Response too large (limit ${MAX_BUFFER_BYTES} bytes): ${redactUrl(targetUrl)}`));
+              return;
+            }
+            chunks.push(chunk);
+          });
           res.on('end', () => succeed(Buffer.concat(chunks)));
           res.on('error', fail);
+          res.on('aborted', () => fail(new Error(`Response aborted: ${redactUrl(targetUrl)}`)));
           return;
         }
 
@@ -258,6 +301,10 @@ function fetchUrl(url, options) {
         res.on('error', (err) => {
           file.destroy();
           fail(err);
+        });
+        res.on('aborted', () => {
+          file.destroy();
+          fail(new Error(`Response aborted: ${redactUrl(targetUrl)}`));
         });
         res.pipe(file);
         file.on('finish', () => {
@@ -282,12 +329,17 @@ function fetchUrl(url, options) {
       currentReq = req;
       req.setTimeout(requestTimeoutMs, () => {
         req.destroy(
-          Object.assign(new Error(`Request timed out after ${requestTimeoutMs}ms: ${targetUrl}`), {
-            code: 'ETIMEDOUT'
-          })
+          Object.assign(
+            new Error(`Request timed out after ${requestTimeoutMs}ms: ${redactUrl(targetUrl)}`),
+            { code: 'ETIMEDOUT' }
+          )
         );
       });
-      req.on('error', fail);
+      // Only the current hop may settle the promise; a late error from a
+      // previous redirect hop must not kill the hop that replaced it.
+      req.on('error', (err) => {
+        if (currentReq === req) fail(err);
+      });
     }
 
     start(url, maxRedirects);
@@ -318,67 +370,66 @@ function isRetryable(err) {
   return RETRYABLE_ERROR_CODES.has(err.code);
 }
 
-async function downloadWithRetry(url, dest, options) {
+// Shared retry loop: one implementation so the binary and the checksum fetch
+// cannot drift apart in attempt count, backoff or env handling.
+async function withRetry(task, options) {
   const retryDelays = options.retryDelays || DEFAULT_RETRY_DELAYS;
   const maxAttempts =
     options.maxAttempts === undefined ? DEFAULT_MAX_ATTEMPTS : options.maxAttempts;
-  const log = options.log;
+  const log = typeof options.log === 'function' ? options.log : () => {};
+  const label = options.label || 'Request';
   let lastError = null;
-  let attempts = 0;
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    attempts = attempt + 1;
     try {
-      await fetchUrl(url, {
-        dest,
-        env: options.env,
-        requestTimeoutMs: options.requestTimeoutMs,
-        totalTimeoutMs: options.totalTimeoutMs
-      });
-      return { ok: true, attempts };
+      const value = await task(attempt + 1);
+      return { ok: true, value, attempts: attempt + 1 };
     } catch (err) {
       lastError = err;
-      removeQuietly(dest);
-
+      if (typeof options.onError === 'function') options.onError(err);
       if (!isRetryable(err) || attempt === maxAttempts - 1) {
-        break;
+        return { ok: false, attempts: attempt + 1, error: lastError };
       }
-
       const delay = retryDelays[Math.min(attempt, retryDelays.length - 1)];
       log(
-        `Download attempt ${attempts}/${maxAttempts} failed (${err.message}); retrying in ${delay}ms`
+        `${label} attempt ${attempt + 1}/${maxAttempts} failed (${err.message}); retrying in ${delay}ms`
       );
       await sleep(delay);
     }
   }
 
-  return { ok: false, attempts, error: lastError };
+  return { ok: false, attempts: maxAttempts, error: lastError };
+}
+
+function fetchOnce(url, options) {
+  return fetchUrl(url, {
+    dest: options.dest,
+    env: options.env,
+    requestTimeoutMs: options.requestTimeoutMs,
+    totalTimeoutMs: options.totalTimeoutMs
+  });
+}
+
+async function downloadWithRetry(url, dest, options) {
+  const result = await withRetry(() => fetchOnce(url, { ...options, dest }), {
+    retryDelays: options.retryDelays,
+    maxAttempts: options.maxAttempts,
+    log: options.log,
+    label: 'Download',
+    onError: () => removeQuietly(dest)
+  });
+  return { ok: result.ok, attempts: result.attempts, error: result.error };
 }
 
 async function fetchWithRetry(url, options) {
-  const retryDelays = options.retryDelays || DEFAULT_RETRY_DELAYS;
-  const maxAttempts =
-    options.maxAttempts === undefined ? DEFAULT_MAX_ATTEMPTS : options.maxAttempts;
-  const log = options.log || (() => {});
-  let lastError = null;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    try {
-      return await fetchUrl(url, {
-        env: options.env,
-        requestTimeoutMs: options.requestTimeoutMs,
-        totalTimeoutMs: options.totalTimeoutMs
-      });
-    } catch (err) {
-      lastError = err;
-      if (!isRetryable(err) || attempt === maxAttempts - 1) break;
-      const delay = retryDelays[Math.min(attempt, retryDelays.length - 1)];
-      log(`Fetch ${url} failed (${err.message}); retrying in ${delay}ms`);
-      await sleep(delay);
-    }
-  }
-
-  throw lastError;
+  const result = await withRetry(() => fetchOnce(url, options), {
+    retryDelays: options.retryDelays,
+    maxAttempts: options.maxAttempts,
+    log: options.log,
+    label: 'Fetch'
+  });
+  if (!result.ok) throw result.error;
+  return result.value;
 }
 
 function parseChecksums(text) {
@@ -404,6 +455,33 @@ function sha256File(filePath) {
     stream.on('end', () => resolve(hash.digest('hex')));
     stream.on('error', reject);
   });
+}
+
+// The old installer wrote straight to the final path, so an interrupted
+// install could leave a truncated file behind. Reject anything that does not
+// start with a known executable magic instead of spawning it.
+function hasBinaryMagic(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const header = Buffer.alloc(4);
+    const read = fs.readSync(fd, header, 0, 4, 0);
+    if (read < 4) return false;
+    if (header.readUInt32BE(0) === 0x7f454c46) return true; // ELF
+    if (header[0] === 0x4d && header[1] === 0x5a) return true; // MZ (Windows)
+    const magic = header.readUInt32BE(0);
+    return [0xfeedface, 0xfeedfacf, 0xcafebabe, 0xbebafeca, 0xcefaedfe, 0xcffaedfe].includes(magic);
+  } catch (err) {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch (closeErr) {
+        // ignore
+      }
+    }
+  }
 }
 
 /**
@@ -439,11 +517,11 @@ async function ensureBinary(options) {
     } catch (err) {
       existingSize = 0;
     }
-    if (existingSize > 0) {
+    if (existingSize > 0 && hasBinaryMagic(binaryPath)) {
       return { ok: true, binaryPath, reason: 'already_present' };
     }
     removeQuietly(binaryPath);
-    log(`Removing empty leftover binary: ${binaryPath}`);
+    log(`Removing unusable leftover binary: ${binaryPath}`);
   }
 
   const version = opts.version || require('../package.json').version;
@@ -458,12 +536,13 @@ async function ensureBinary(options) {
 
   fs.mkdirSync(binDir, { recursive: true });
 
-  log(`Downloading ${binaryName} (${urls.tag}) from ${urls.url}`);
+  log(`Downloading ${binaryName} (${urls.tag}) from ${redactUrl(urls.url)}`);
   const download = await downloadWithRetry(urls.url, tmpPath, {
     retryDelays,
     maxAttempts,
     requestTimeoutMs,
     totalTimeoutMs,
+    env: opts.env,
     log
   });
 
@@ -496,7 +575,7 @@ async function ensureBinary(options) {
     checksumsText = body.toString('utf8');
   } catch (err) {
     removeQuietly(tmpPath);
-    log(`Failed to download checksums from ${urls.checksumsUrl}: ${err.message}`);
+    log(`Failed to download checksums from ${redactUrl(urls.checksumsUrl)}: ${err.message}`);
     return {
       ok: false,
       binaryPath,
@@ -511,7 +590,7 @@ async function ensureBinary(options) {
   const expected = parseChecksums(checksumsText).get(binaryName);
   if (!expected) {
     removeQuietly(tmpPath);
-    log(`No checksum entry for ${binaryName} in ${urls.checksumsUrl}`);
+    log(`No checksum entry for ${binaryName} in ${redactUrl(urls.checksumsUrl)}`);
     return {
       ok: false,
       binaryPath,
@@ -522,7 +601,21 @@ async function ensureBinary(options) {
     };
   }
 
-  const actual = await sha256File(tmpPath);
+  let actual;
+  try {
+    actual = await sha256File(tmpPath);
+  } catch (err) {
+    removeQuietly(tmpPath);
+    return {
+      ok: false,
+      binaryPath,
+      reason: 'fs_error',
+      url: urls.url,
+      checksumsUrl: urls.checksumsUrl,
+      attempts: download.attempts,
+      error: err
+    };
+  }
   if (actual !== expected) {
     removeQuietly(tmpPath);
     log(`Checksum mismatch for ${binaryName}: expected ${expected}, got ${actual}`);
@@ -538,10 +631,22 @@ async function ensureBinary(options) {
     };
   }
 
-  fs.renameSync(tmpPath, binaryPath);
-
-  if (platform !== 'win32') {
-    fs.chmodSync(binaryPath, 0o755);
+  try {
+    fs.renameSync(tmpPath, binaryPath);
+    if (platform !== 'win32') {
+      fs.chmodSync(binaryPath, 0o755);
+    }
+  } catch (err) {
+    removeQuietly(tmpPath);
+    return {
+      ok: false,
+      binaryPath,
+      reason: 'fs_error',
+      url: urls.url,
+      checksumsUrl: urls.checksumsUrl,
+      attempts: download.attempts,
+      error: err
+    };
   }
 
   return { ok: true, binaryPath, reason: 'downloaded', attempts: download.attempts };

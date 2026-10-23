@@ -26,14 +26,17 @@ npm 12 起默认不运行依赖的 install scripts（等价于 `--ignore-scripts
 `ignore-scripts=true`），因此本包的 `postinstall` 可能被拦截。放行方式：
 
 ```bash
-# 方式一：安装时一次性放行（npm 自己给出的提示命令）
+# 方式一：安装时一次性放行（推荐，全局安装）
 npm install -g --allow-scripts=@thntime/opencode-tunnel
 
-# 方式二：安装后显式批准
-npm install -g @thntime/opencode-tunnel
-npm install-scripts approve @thntime/opencode-tunnel   # 允许该包运行 postinstall
-npm install-scripts ls                                 # 查看当前放行清单
+# 方式二：写入用户级配置，之后的全局安装都生效
+npm config set allow-scripts=@thntime/opencode-tunnel --location=user
+npm config get allow-scripts                          # 查看当前配置
 ```
+
+> `npm install-scripts approve @thntime/opencode-tunnel` 只适用于**项目内**安装（需要项目里的
+> `package.json`）；对全局安装（`-g`）使用会报 `EGLOBAL: npm install-scripts does not work for
+> global installs`，不要混用。
 
 不放行也**不会**导致安装失败：包本身仍会安装成功，首次运行 `opencode-tunnel` 时会自动补下载
 二进制（同样经过 `SHA256SUMS` 校验），区别只是下载时机从安装时推迟到首次运行。
@@ -91,8 +94,9 @@ opencode-tunnel
 
 镜像通常只同步二进制，不提供 `SHA256SUMS`，此时必须用 `OPENCODE_TUNNEL_SHA256SUMS_URL`
 指向可用的校验和文件。下载最多尝试 **4 次**（3 次重试，退避 1s / 2s / 4s）；每次尝试的 socket
-空闲超时为 10s、单次尝试上限 120s。`SHA256SUMS` 下载同样会重试。校验不通过不会落地或执行
-二进制，临时文件 `<binary>.download` 会被清理。
+空闲超时为 10s、单次尝试上限 300s。10s 空闲超时才是「卡死」的判定依据；300s 只用于兜住极端
+慢速链路（例如极慢的镜像），避免正常但很慢的下载被误杀。`SHA256SUMS` 下载同样会重试。校验不通过
+不会落地或执行二进制，临时文件 `<binary>.download` 会被清理。
 
 ### 代理与镜像
 
@@ -102,7 +106,7 @@ opencode-tunnel
 | --- | --- |
 | `HTTPS_PROXY` / `https_proxy` | https 目标（默认下载地址）使用的代理 |
 | `HTTP_PROXY` / `http_proxy` | http 目标使用的代理；https 目标未设置 `HTTPS_PROXY` 时回退使用 |
-| `NO_PROXY` / `no_proxy` | 不走代理的主机，支持 `*`、`.example.com`、`127.0.0.1` 等写法 |
+| `NO_PROXY` / `no_proxy` | 不走代理的主机，支持 `*`、`*.example.com`、`.example.com`、`127.0.0.1`、`host:port`、`[::1]` 等写法 |
 
 ```bash
 export HTTPS_PROXY="http://proxy.corp.example:8080"
@@ -172,10 +176,17 @@ Since npm 12, dependency install scripts are not run by default (the same effect
 allow it:
 
 ```bash
-npm install -g @thntime/opencode-tunnel
-npm install-scripts approve @thntime/opencode-tunnel   # allow this package to run postinstall
-npm install-scripts ls                                 # list the current allow list
+# Option 1: allow it once at install time (recommended, global install)
+npm install -g --allow-scripts=@thntime/opencode-tunnel
+
+# Option 2: persist it in the user config for future global installs
+npm config set allow-scripts=@thntime/opencode-tunnel --location=user
+npm config get allow-scripts                          # show the current setting
 ```
+
+> `npm install-scripts approve @thntime/opencode-tunnel` only works for **project-local** installs
+> (it needs the project's `package.json`). With `-g` npm 12 fails with
+> `EGLOBAL: npm install-scripts does not work for global installs`, so do not use it there.
 
 Not allowing it does **not** break the install: the package still installs, and the first
 `opencode-tunnel` run downloads the binary (verified against `SHA256SUMS` as well). The only
@@ -227,8 +238,10 @@ opencode-tunnel
 ```
 
 Downloads make up to **4 attempts** (3 retries with 1s / 2s / 4s backoff). Each attempt has a 10s
-socket idle timeout and a 120s cap; `SHA256SUMS` downloads are retried the same way. A checksum
-mismatch never leaves an executable behind, and the temporary `<binary>.download` file is cleaned up.
+socket idle timeout and a 300s cap; the 10s idle timeout is what detects a stuck connection, while the
+300s cap only guards against extremely slow links (e.g. a very slow mirror) so a slow-but-working
+download is not killed. `SHA256SUMS` downloads are retried the same way. A checksum mismatch never
+leaves an executable behind, and the temporary `<binary>.download` file is cleaned up.
 
 ### Proxy and mirror
 
@@ -239,7 +252,7 @@ networks where only a proxy can reach GitHub:
 | --- | --- |
 | `HTTPS_PROXY` / `https_proxy` | Proxy for https targets (the default download URL) |
 | `HTTP_PROXY` / `http_proxy` | Proxy for http targets; also used for https when `HTTPS_PROXY` is unset |
-| `NO_PROXY` / `no_proxy` | Hosts that bypass the proxy; `*`, `.example.com`, and `127.0.0.1` are supported |
+| `NO_PROXY` / `no_proxy` | Hosts that bypass the proxy; `*`, `*.example.com`, `.example.com`, `127.0.0.1`, `host:port`, and `[::1]` are supported |
 
 ```bash
 export HTTPS_PROXY="http://proxy.corp.example:8080"

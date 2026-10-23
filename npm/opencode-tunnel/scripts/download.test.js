@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const net = require('node:net');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -78,6 +79,61 @@ function makeBinDir(t) {
   return dir;
 }
 
+// A local proxy that only speaks CONNECT: it tunnels the client to whatever
+// host:port the CONNECT line names, so no test ever needs the real internet.
+// `connects` records every CONNECT target for assertions.
+async function withConnectProxy(fn) {
+  const connects = [];
+  const upstreams = new Set();
+  const proxy = http.createServer((req, res) => {
+    res.writeHead(405);
+    res.end('CONNECT only');
+  });
+
+  proxy.on('connect', (req, clientSocket, head) => {
+    connects.push(req.url);
+    const separator = req.url.lastIndexOf(':');
+    const host = req.url.slice(0, separator);
+    const port = Number(req.url.slice(separator + 1));
+
+    const upstream = net.connect(port, host, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head && head.length > 0) upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    upstreams.add(upstream);
+    upstream.on('close', () => upstreams.delete(upstream));
+    upstream.on('error', () => clientSocket.destroy());
+    clientSocket.on('error', () => upstream.destroy());
+  });
+
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+  try {
+    return await fn(`http://127.0.0.1:${proxy.address().port}`, connects);
+  } finally {
+    for (const upstream of upstreams) upstream.destroy();
+    if (typeof proxy.closeAllConnections === 'function') proxy.closeAllConnections();
+    await new Promise((resolve) => proxy.close(resolve));
+  }
+}
+
+// Serves the binary and its SHA256SUMS; shared by the proxy tests below.
+function serveRelease(req, res) {
+  if (req.url === BINARY_ROUTE) {
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(PAYLOAD);
+    return;
+  }
+  if (req.url === SUMS_ROUTE) {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end(GOOD_SUMS);
+    return;
+  }
+  res.writeHead(404);
+  res.end('not found');
+}
+
 function fastOptions(binDir, extra) {
   return Object.assign(
     {
@@ -131,7 +187,9 @@ test('short-circuits when the binary already exists', async (t) => {
   const binDir = makeBinDir(t);
   isolateEnv(t);
   const binaryPath = path.join(binDir, BINARY_NAME);
-  fs.writeFileSync(binaryPath, PAYLOAD);
+  // A real binary starts with a known magic; a plain text placeholder is now
+  // treated as a truncated leftover and re-downloaded.
+  fs.writeFileSync(binaryPath, Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), PAYLOAD]));
 
   let requests = 0;
   await withServer(
@@ -147,6 +205,33 @@ test('short-circuits when the binary already exists', async (t) => {
       assert.equal(result.ok, true);
       assert.equal(result.reason, 'already_present');
       assert.equal(requests, 0);
+    }
+  );
+});
+
+test('re-downloads when the existing file is not a real binary', async (t) => {
+  const binDir = makeBinDir(t);
+  isolateEnv(t);
+  const binaryPath = path.join(binDir, BINARY_NAME);
+  fs.writeFileSync(binaryPath, 'truncated');
+
+  await withServer(
+    (req, res) => {
+      if (req.url.endsWith('SHA256SUMS')) {
+        res.writeHead(200);
+        res.end(`${GOOD_HASH}  ${BINARY_NAME}\n`);
+        return;
+      }
+      res.writeHead(200);
+      res.end(PAYLOAD);
+    },
+    async (base) => {
+      const restoreEnv = withEnv({ OPENCODE_TUNNEL_DOWNLOAD_BASE: base });
+      t.after(restoreEnv);
+      const result = await ensureBinary(fastOptions(binDir));
+      assert.equal(result.ok, true);
+      assert.equal(result.reason, 'downloaded');
+      assert.deepEqual(fs.readFileSync(binaryPath), PAYLOAD);
     }
   );
 });
@@ -411,6 +496,60 @@ test('follows a relative redirect before downloading', async (t) => {
       assert.deepEqual(fs.readFileSync(path.join(binDir, BINARY_NAME)), PAYLOAD);
     }
   );
+});
+
+test('downloads through an HTTP CONNECT proxy and still verifies the checksum', async (t) => {
+  const binDir = makeBinDir(t);
+  isolateEnv(t);
+
+  await withConnectProxy(async (proxyUrl, connects) => {
+    await withServer(serveRelease, async (base) => {
+      // isolateEnv() cleared every proxy variable; set them only now.
+      const restoreEnv = withEnv({
+        OPENCODE_TUNNEL_DOWNLOAD_BASE: base,
+        HTTP_PROXY: proxyUrl
+      });
+      t.after(restoreEnv);
+
+      const result = await ensureBinary(fastOptions(binDir));
+
+      assert.equal(result.ok, true);
+      assert.equal(result.reason, 'downloaded');
+      assert.deepEqual(fs.readFileSync(path.join(binDir, BINARY_NAME)), PAYLOAD);
+      assert.ok(
+        connects.length >= 1,
+        `expected at least one CONNECT request, saw ${connects.length}`
+      );
+      assert.equal(connects[0], new URL(base).host);
+    });
+  });
+});
+
+test('bypasses the proxy when NO_PROXY matches the download host', async (t) => {
+  const binDir = makeBinDir(t);
+  isolateEnv(t);
+
+  await withConnectProxy(async (proxyUrl, connects) => {
+    await withServer(serveRelease, async (base) => {
+      const restoreEnv = withEnv({
+        OPENCODE_TUNNEL_DOWNLOAD_BASE: base,
+        HTTP_PROXY: proxyUrl,
+        NO_PROXY: '127.0.0.1'
+      });
+      t.after(restoreEnv);
+
+      const result = await ensureBinary(fastOptions(binDir));
+
+      assert.equal(result.ok, true);
+      assert.equal(result.reason, 'downloaded');
+      assert.deepEqual(fs.readFileSync(path.join(binDir, BINARY_NAME)), PAYLOAD);
+      assert.equal(
+        connects.length,
+        0,
+        `expected a direct connection, saw ${connects.length} CONNECT(s)`
+      );
+    });
+  });
 });
 
 test('returns unsupported_platform for an unknown platform', async (t) => {

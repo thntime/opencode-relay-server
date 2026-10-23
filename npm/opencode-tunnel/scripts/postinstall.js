@@ -1,6 +1,6 @@
 'use strict';
 
-const { ensureBinary, printManualInstructions } = require('./download.js');
+const { ensureBinary, printManualInstructions, redactUrl } = require('./download.js');
 
 async function main() {
   const result = await ensureBinary();
@@ -19,7 +19,7 @@ async function main() {
     console.error(`Reason: ${result.error.message}`);
   }
   if (result.url) {
-    console.error(`URL: ${result.url}`);
+    console.error(`URL: ${redactUrl(result.url)}`);
   }
   printManualInstructions(result);
   console.error('');

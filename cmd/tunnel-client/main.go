@@ -526,10 +526,10 @@ func dispatch(args []string) int {
 	}
 
 	switch args[0] {
-	case "help", "-h", "--help":
+	case "help", "-h", "-help", "--help":
 		printUsage()
 		return 0
-	case "version", "-v", "--version":
+	case "version", "-v", "-version", "--version":
 		printVersion()
 		return 0
 	}
@@ -574,10 +574,8 @@ Commands:
   status    Show current status
   discover  Discover running opencode instances
   logout    Logout and clear credentials
-  version   Print version information
-
-  help, -h, --help        Print this help
-  version, -v, --version  Print version information
+  version   Print version information (also -v, --version)
+  help      Print this help (also -h, --help)
 
 Options:
   -port <port>          Local OpenCode port (default: %s)
