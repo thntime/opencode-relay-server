@@ -1,6 +1,6 @@
 {
   "name": "@thntime/opencode-tunnel",
-  "version": "0.9.7",
+  "version": "0.9.9",
   "description": "OpenCode Mobile tunnel client for secure remote access to OpenCode",
   "bin": {
     "opencode-tunnel": "./bin/cli.js"

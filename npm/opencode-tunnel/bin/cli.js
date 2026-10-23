@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -26,8 +26,20 @@ function main() {
   
   if (!fs.existsSync(binaryPath)) {
     console.error(`Binary not found: ${binaryPath}`);
-    console.error('Try reinstalling: npm install -g @thntime/opencode-tunnel');
-    process.exit(1);
+    console.error('Downloading tunnel-client...');
+    try {
+      execFileSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'postinstall.js')], {
+        stdio: 'inherit'
+      });
+    } catch (err) {
+      console.error('Download failed.');
+      console.error('Try reinstalling: npm install -g @thntime/opencode-tunnel');
+      process.exit(1);
+    }
+    if (!fs.existsSync(binaryPath)) {
+      console.error(`Binary still not found: ${binaryPath}`);
+      process.exit(1);
+    }
   }
   
   if (os.platform() !== 'win32') {
