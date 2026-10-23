@@ -1,8 +1,8 @@
 name: Docker
 
-# 构建并推送 Relay 服务端镜像到 GitHub Container Registry。
-# 上游的 deploy-azure.yml / deploy-ws-test.yml 绑定 zero469 的 Azure 凭据，fork 里跑不了；
-# 这个工作流只依赖 GITHUB_TOKEN，任何 fork 都能直接用。
+# 构建并推送 Relay 服务端镜像到 Docker Hub。
+# 上游的 deploy-azure.yml / deploy-ws-test.yml 绑定上游 Azure 凭据，fork 里跑不了；
+# 这个工作流只依赖 Docker Hub 凭据，任何 fork 配置好 secrets 后都能直接用。
 on:
   push:
     branches: [main]
@@ -10,13 +10,13 @@ on:
   workflow_dispatch:
     inputs:
       push:
-        description: '推送到 ghcr.io（关闭则只构建验证）'
+        description: '推送到 Docker Hub（关闭则只构建验证）'
         type: boolean
         default: true
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  REGISTRY: docker.io
+  IMAGE_NAME: thntime/opencode-relay-server
 
 concurrency:
   group: docker-${{ github.ref }}
@@ -27,7 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
 
     steps:
       - name: Checkout
@@ -47,13 +46,13 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
+      - name: Log in to Docker Hub
         if: github.event_name != 'workflow_dispatch' || inputs.push
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta
@@ -61,11 +60,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6

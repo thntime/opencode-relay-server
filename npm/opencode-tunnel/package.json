@@ -1,7 +1,7 @@
 {
-  "name": "@zero469/opencode-tunnel",
+  "name": "@thntime/opencode-tunnel",
   "version": "0.9.7",
-  "description": "OpenCode Anywhere - Tunnel client for remote access to OpenCode",
+  "description": "OpenCode Mobile tunnel client for secure remote access to OpenCode",
   "bin": {
     "opencode-tunnel": "./bin/cli.js"
   },
@@ -10,20 +10,22 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/zero469/opencode-relay-server.git"
+    "url": "https://github.com/zhangjinglei137/opencode-relay-server.git",
+    "directory": "npm/opencode-tunnel"
   },
   "keywords": [
     "opencode",
     "tunnel",
     "remote",
+    "relay",
     "cli"
   ],
-  "author": "zero469",
+  "author": "zhangjinglei137",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/zero469/opencode-relay-server/issues"
+    "url": "https://github.com/zhangjinglei137/opencode-relay-server/issues"
   },
-  "homepage": "https://github.com/zero469/opencode-relay-server#readme",
+  "homepage": "https://github.com/zhangjinglei137/opencode-relay-server#readme",
   "engines": {
     "node": ">=14"
   },

@@ -5,7 +5,23 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run tests
+        run: go test ./...
+
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -33,7 +49,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.24'
 
       - name: Build tunnel-client
         env:
@@ -49,7 +65,7 @@ jobs:
           path: tunnel-client-${{ matrix.suffix }}
 
   release:
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -66,18 +82,21 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -type f -name 'tunnel-client-*' -exec mv {} release/ \;
-          ls -la release/
+          cd release
+          sha256sum tunnel-client-* > SHA256SUMS
+          ls -la
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: release/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
 
   publish-npm:
     needs: release
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/checkout@v4
 
@@ -87,11 +106,21 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Check npm token
+        working-directory: npm/opencode-tunnel
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN is not configured; skipping npm publish is not allowed for a release tag."
+            exit 1
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Update package version
         working-directory: npm/opencode-tunnel
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          npm version $VERSION --no-git-tag-version --allow-same-version
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Publish to npm
         working-directory: npm/opencode-tunnel

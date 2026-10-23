@@ -26,7 +26,7 @@ function main() {
   
   if (!fs.existsSync(binaryPath)) {
     console.error(`Binary not found: ${binaryPath}`);
-    console.error('Try reinstalling: npm install -g opencode-tunnel');
+    console.error('Try reinstalling: npm install -g @thntime/opencode-tunnel');
     process.exit(1);
   }
   

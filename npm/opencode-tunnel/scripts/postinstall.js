@@ -4,7 +4,7 @@ const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
 
-const REPO = 'zero469/opencode-relay-server';
+const REPO = 'zhangjinglei137/opencode-relay-server';
 const VERSION = require('../package.json').version;
 
 const PLATFORM_MAP = {
