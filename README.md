@@ -6,9 +6,9 @@
 
 **通过加密隧道，从任何地方安全访问你的 OpenCode 实例**
 
-为 [OpenCode Mobile](https://github.com/zhangjinglei137/opencode-mobile) 提供 Relay 基础设施：把你的 AI 编码助手安全地带到任何网络。
+为 [OpenCode Mobile](https://github.com/thntime/opencode-mobile) 提供 Relay 基础设施：把你的 AI 编码助手安全地带到任何网络。
 
-[![GitHub Stars](https://img.shields.io/github/stars/zhangjinglei137/opencode-relay-server?style=for-the-badge)](https://github.com/zhangjinglei137/opencode-relay-server)
+[![GitHub Stars](https://img.shields.io/github/stars/thntime/opencode-relay-server?style=for-the-badge)](https://github.com/thntime/opencode-relay-server)
 [![Docker](https://img.shields.io/badge/docker-thntime%2Fopencode--relay--server-blue?style=for-the-badge&logo=docker)](https://hub.docker.com/r/thntime/opencode-relay-server)
 [![npm](https://img.shields.io/badge/npm-%40thntime%2Fopencode--tunnel-cb3837?style=for-the-badge&logo=npm)](https://www.npmjs.com/package/@thntime/opencode-tunnel)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](https://opensource.org/licenses/MIT)
@@ -76,7 +76,7 @@ Relay 只负责转发加密数据，不持有你的端到端密钥，也不读�
 | 用途 | 渠道 | 命令 / 入口 |
 |------|------|-------------|
 | 安装 tunnel client | npm | `npm install -g @thntime/opencode-tunnel` |
-| 手动下载客户端 | GitHub Releases | [Releases](https://github.com/zhangjinglei137/opencode-relay-server/releases) |
+| 手动下载客户端 | GitHub Releases | [Releases](https://github.com/thntime/opencode-relay-server/releases) |
 | 运行 Relay Server | Docker Hub | `docker pull thntime/opencode-relay-server:latest` |
 
 ### 通过 npm 安装客户端
@@ -132,7 +132,7 @@ docker run -d --name opencode-relay \
 
 ### 前置条件
 
-- [OpenCode Mobile](https://github.com/zhangjinglei137/opencode-mobile) 应用，并已在应用中创建账号
+- [OpenCode Mobile](https://github.com/thntime/opencode-mobile) 应用，并已在应用中创建账号
 - 电脑上已安装 [OpenCode](https://github.com/sst/opencode)
 - 通过 npm 安装时需要 Node.js 14+
 
@@ -227,7 +227,7 @@ opencode-tunnel help
 
 ```bash
 # 克隆仓库
-git clone https://github.com/zhangjinglei137/opencode-relay-server.git
+git clone https://github.com/thntime/opencode-relay-server.git
 cd opencode-relay-server
 
 # 构建
@@ -500,7 +500,7 @@ git push origin v1.2.3
 
 ## 相关项目 / Related Projects
 
-- **[OpenCode Mobile](https://github.com/zhangjinglei137/opencode-mobile)** — 配套移动端应用
+- **[OpenCode Mobile](https://github.com/thntime/opencode-mobile)** — 配套移动端应用
 - **[OpenCode](https://github.com/sst/opencode)** — AI 编码助手
 
 ## 许可证 / License

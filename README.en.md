@@ -6,9 +6,9 @@
 
 **Secure remote access to your OpenCode instances over encrypted tunnels**
 
-The relay infrastructure for [OpenCode Mobile](https://github.com/zhangjinglei137/opencode-mobile) — bringing your AI coding assistant to any network, safely.
+The relay infrastructure for [OpenCode Mobile](https://github.com/thntime/opencode-mobile) — bringing your AI coding assistant to any network, safely.
 
-[![GitHub Stars](https://img.shields.io/github/stars/zhangjinglei137/opencode-relay-server?style=for-the-badge)](https://github.com/zhangjinglei137/opencode-relay-server)
+[![GitHub Stars](https://img.shields.io/github/stars/thntime/opencode-relay-server?style=for-the-badge)](https://github.com/thntime/opencode-relay-server)
 [![Docker](https://img.shields.io/badge/docker-thntime%2Fopencode--relay--server-blue?style=for-the-badge&logo=docker)](https://hub.docker.com/r/thntime/opencode-relay-server)
 [![npm](https://img.shields.io/badge/npm-%40thntime%2Fopencode--tunnel-cb3837?style=for-the-badge&logo=npm)](https://www.npmjs.com/package/@thntime/opencode-tunnel)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](https://opensource.org/licenses/MIT)
@@ -76,7 +76,7 @@ Choose the channel that fits your use case:
 | Use case | Channel | Command / entry point |
 |----------|---------|-----------------------|
 | Install the tunnel client | npm | `npm install -g @thntime/opencode-tunnel` |
-| Download the client manually | GitHub Releases | [Releases](https://github.com/zhangjinglei137/opencode-relay-server/releases) |
+| Download the client manually | GitHub Releases | [Releases](https://github.com/thntime/opencode-relay-server/releases) |
 | Run the Relay Server | Docker Hub | `docker pull thntime/opencode-relay-server:latest` |
 
 ### Install the client via npm
@@ -132,7 +132,7 @@ The image supports `linux/amd64` and `linux/arm64`. Tags include `latest`, seman
 
 ### Prerequisites
 
-- [OpenCode Mobile](https://github.com/zhangjinglei137/opencode-mobile), with an account created in the app
+- [OpenCode Mobile](https://github.com/thntime/opencode-mobile), with an account created in the app
 - [OpenCode](https://github.com/sst/opencode) installed on your computer
 - Node.js 14+ if you install the client via npm
 
@@ -227,7 +227,7 @@ Located in `~/.opencode-tunnel/`:
 
 ```bash
 # Clone
-git clone https://github.com/zhangjinglei137/opencode-relay-server.git
+git clone https://github.com/thntime/opencode-relay-server.git
 cd opencode-relay-server
 
 # Build
@@ -500,7 +500,7 @@ After publishing, verify:
 
 ## 相关项目 / Related Projects
 
-- **[OpenCode Mobile](https://github.com/zhangjinglei137/opencode-mobile)** — the companion mobile app
+- **[OpenCode Mobile](https://github.com/thntime/opencode-mobile)** — the companion mobile app
 - **[OpenCode](https://github.com/sst/opencode)** — the AI coding assistant
 
 ## 许可证 / License

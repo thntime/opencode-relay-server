@@ -13,7 +13,7 @@ npm install -g @thntime/opencode-tunnel
 ```
 
 安装脚本会根据当前平台和包版本，从
-[GitHub Releases](https://github.com/zhangjinglei137/opencode-relay-server/releases)
+[GitHub Releases](https://github.com/thntime/opencode-relay-server/releases)
 下载对应的 `tunnel-client` 二进制。
 
 ### 使用
@@ -33,7 +33,7 @@ opencode-tunnel logout
 ```
 
 首次运行会登录、注册主机，并使用口令包裹 E2E 密钥。完整参数、自托管和协议说明见
-[主仓库 README](https://github.com/zhangjinglei137/opencode-relay-server#readme)。
+[主仓库 README](https://github.com/thntime/opencode-relay-server#readme)。
 
 ### 支持平台
 
@@ -56,7 +56,7 @@ npm install -g @thntime/opencode-tunnel
 ```
 
 The install script downloads the matching `tunnel-client` binary for your platform and package
-version from [GitHub Releases](https://github.com/zhangjinglei137/opencode-relay-server/releases).
+version from [GitHub Releases](https://github.com/thntime/opencode-relay-server/releases).
 
 ### Usage
 
@@ -75,7 +75,7 @@ opencode-tunnel logout
 ```
 
 The first run logs in, registers the host, and wraps the E2E key with a passphrase. See the
-[main README](https://github.com/zhangjinglei137/opencode-relay-server#readme) for all options,
+[main README](https://github.com/thntime/opencode-relay-server#readme) for all options,
 self-hosting, and protocol details.
 
 ### Supported platforms
