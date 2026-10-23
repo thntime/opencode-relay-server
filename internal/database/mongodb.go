@@ -33,6 +33,7 @@ func NewMongoDB(uri string) (*MongoDB, error) {
 	}
 
 	if err := client.Ping(ctx, nil); err != nil {
+		_ = client.Disconnect(ctx)
 		return nil, err
 	}
 
@@ -49,6 +50,7 @@ func NewMongoDB(uri string) (*MongoDB, error) {
 	}
 
 	if err := mdb.createIndexes(ctx); err != nil {
+		_ = client.Disconnect(ctx)
 		return nil, err
 	}
 
@@ -167,6 +169,57 @@ func (m *MongoDB) GetUserByEmail(email string) (*models.User, error) {
 		return nil, err
 	}
 	return &user, nil
+}
+
+func (m *MongoDB) ListUsers() ([]*models.User, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cursor, err := m.users.Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "id", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var users []*models.User
+	if err := cursor.All(ctx, &users); err != nil {
+		return nil, err
+	}
+	return users, nil
+}
+
+func (m *MongoDB) UpdateUserEmail(id int64, email string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := m.users.UpdateOne(ctx, bson.M{"id": id}, bson.M{"$set": bson.M{
+		"email":      email,
+		"updated_at": time.Now(),
+	}})
+	if err != nil {
+		return err
+	}
+	if result.MatchedCount == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+func (m *MongoDB) UpdateUserPassword(id int64, passwordHash string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := m.users.UpdateOne(ctx, bson.M{"id": id}, bson.M{"$set": bson.M{
+		"password_hash": passwordHash,
+		"updated_at":    time.Now(),
+	}})
+	if err != nil {
+		return err
+	}
+	if result.MatchedCount == 0 {
+		return ErrUserNotFound
+	}
+	return nil
 }
 
 func (m *MongoDB) CreateDevice(userID int64, name, subdomain, authUser, authPassword string) (*models.Device, error) {

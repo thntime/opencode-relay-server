@@ -913,7 +913,7 @@ func stubAutoStart(t *testing.T) *[]string {
 	t.Helper()
 	calls := []string{}
 	old := setupAutoStart
-	setupAutoStart = func(localPort string) error {
+	setupAutoStart = func(localPort, relay string, attach bool) error {
 		calls = append(calls, localPort)
 		return nil
 	}
@@ -2669,6 +2669,274 @@ func TestDispatchRoutesToStart(t *testing.T) {
 			_ = code
 			if calls != tc.wantCall {
 				t.Fatalf("dispatch(%v) called startCommand %d time(s), want %d", tc.args, calls, tc.wantCall)
+			}
+		})
+	}
+}
+
+// --- systemd 自启 unit 生成（design D4） ---
+
+// systemdExecStart 取出生成 unit 中的 ExecStart= 行。
+func systemdExecStart(t *testing.T, unit string) string {
+	t.Helper()
+	for _, line := range strings.Split(unit, "\n") {
+		if strings.HasPrefix(line, "ExecStart=") {
+			return strings.TrimPrefix(line, "ExecStart=")
+		}
+	}
+	t.Fatalf("unit has no ExecStart line:\n%s", unit)
+	return ""
+}
+
+func TestBuildSystemdUnit(t *testing.T) {
+	tests := []struct {
+		name      string
+		localPort string
+		relay     string
+		attach    bool
+		want      []string
+		notWant   []string
+	}{
+		{
+			name:      "default relay and no attach",
+			localPort: "4096",
+			relay:     "https://example.test",
+			want:      []string{"start -relay https://example.test -port 4096"},
+			notWant:   []string{"--attach"},
+		},
+		{
+			name:      "attach adds flag",
+			localPort: "4096",
+			relay:     "https://example.test",
+			attach:    true,
+			want:      []string{"start -relay https://example.test --attach -port 4096"},
+		},
+		{
+			name:      "custom port",
+			localPort: "5123",
+			relay:     "http://relay.local:14096",
+			want:      []string{"-relay http://relay.local:14096", "-port 5123"},
+			notWant:   []string{"-port 4096"},
+		},
+		{
+			// 空 relay 必须回退到 defaultRelay 并显式写入，否则开机自启会
+			// 依赖客户端自己的默认值，和安装时解析结果脱节。
+			name:      "empty relay falls back to default",
+			localPort: "4096",
+			relay:     "",
+			want:      []string{"start -relay " + defaultRelay + " -port 4096"},
+			notWant:   []string{"-relay  -port"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			unit := buildSystemdUnit(tc.localPort, tc.relay, tc.attach, "/usr/local/bin/tunnel-client")
+			execStart := systemdExecStart(t, unit)
+			for _, want := range tc.want {
+				if !strings.Contains(execStart, want) {
+					t.Fatalf("ExecStart = %q, want it to contain %q", execStart, want)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(execStart, notWant) {
+					t.Fatalf("ExecStart = %q, must not contain %q", execStart, notWant)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildSystemdUnitOmitsSecrets(t *testing.T) {
+	unit := buildSystemdUnit("4096", "https://example.test", true, "/usr/local/bin/tunnel-client")
+	lower := strings.ToLower(unit)
+	for _, word := range []string{"passphrase", "password", "token", "secret"} {
+		if strings.Contains(lower, word) {
+			t.Fatalf("unit must not carry credentials, found %q:\n%s", word, unit)
+		}
+	}
+}
+
+// systemd 会对 ExecStart 做 specifier 展开与空白拆分，因此参数必须转义。
+func TestSystemdEscapeArg(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "plain url unchanged",
+			in:   "https://relay.example.test",
+			want: "https://relay.example.test",
+		},
+		{
+			name: "percent is doubled and quoted",
+			in:   "https://relay.example.test/%2Fuser",
+			want: `"https://relay.example.test/%%2Fuser"`,
+		},
+		{
+			name: "space is quoted",
+			in:   "https://relay.example.test/a b",
+			want: `"https://relay.example.test/a b"`,
+		},
+		{
+			name: "double quote is escaped",
+			in:   `https://relay.example.test/a"b`,
+			want: `"https://relay.example.test/a\"b"`,
+		},
+		{
+			name: "backslash is escaped",
+			in:   `C:\relay\tunnel`,
+			want: `"C:\\relay\\tunnel"`,
+		},
+		{
+			name: "empty is quoted",
+			in:   "",
+			want: `""`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := systemdEscapeArg(tc.in); got != tc.want {
+				t.Fatalf("systemdEscapeArg(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildSystemdUnitEscapesRelay(t *testing.T) {
+	unit := buildSystemdUnit("4096", "https://relay.example.test/%2Fuser", false, "/usr/local/bin/tunnel-client")
+	execStart := systemdExecStart(t, unit)
+	want := `-relay "https://relay.example.test/%%2Fuser"`
+	if !strings.Contains(execStart, want) {
+		t.Fatalf("ExecStart = %q, want it to contain %q", execStart, want)
+	}
+	if strings.Contains(execStart, `-relay https://relay.example.test/%2Fuser`) {
+		t.Fatalf("ExecStart = %q, relay must not be left unescaped", execStart)
+	}
+}
+
+func TestBuildSystemdUnitUsesExecPath(t *testing.T) {
+	unit := buildSystemdUnit("4096", "https://example.test", false, "/opt/opencode tunnel/tunnel-client")
+	execStart := systemdExecStart(t, unit)
+	if !strings.HasPrefix(execStart, `"/opt/opencode tunnel/tunnel-client" `) {
+		t.Fatalf("ExecStart = %q, want it to start with the escaped executable path", execStart)
+	}
+}
+
+// setupSystemd 必须在无法解析可执行文件时失败，而不是写入一个开机必失败的 unit。
+func TestSetupSystemdFailsWhenExecutableUnknown(t *testing.T) {
+	old := osExecutable
+	osExecutable = func() (string, error) { return "", errors.New("executable unavailable") }
+	t.Cleanup(func() { osExecutable = old })
+
+	if err := setupSystemd("4096", "https://example.test", false); err == nil {
+		t.Fatal("setupSystemd() error = nil, want executable lookup error")
+	}
+}
+
+// installAutoStart 必须把安装时解析出的 relay 与 --attach 透传给自启安装，
+// 否则 unit 记录的行为与安装时不一致。
+func TestInstallPassesRelayAndAttachToAutoStart(t *testing.T) {
+	withTempConfigDir(t)
+	if err := saveDeviceConfig(&DeviceConfig{
+		DeviceName: "box", RelayURL: "https://relay.example", Subdomain: "s1", HostID: "s1",
+		AuthUser: "u", AuthPassword: "p",
+		KeyWrapped: "wrapped", KeySalt: "salt", KeyKdf: keyKdfScrypt,
+	}); err != nil {
+		t.Fatalf("saveDeviceConfig: %v", err)
+	}
+
+	var gotRelay string
+	var gotAttach bool
+	old := setupAutoStart
+	setupAutoStart = func(localPort, relay string, attach bool) error {
+		gotRelay, gotAttach = relay, attach
+		return nil
+	}
+	t.Cleanup(func() { setupAutoStart = old })
+
+	if err := installAutoStart(startOptions{Attach: true}, "https://relay.example", "box", "5000"); err != nil {
+		t.Fatalf("installAutoStart: %v", err)
+	}
+	if gotRelay != "https://relay.example" {
+		t.Fatalf("relay = %q, want https://relay.example", gotRelay)
+	}
+	if !gotAttach {
+		t.Fatal("--attach must be passed through to the autostart installer")
+	}
+}
+
+// 已有完整设备配置时也必须解析 relay：显式 -relay > device.RelayURL >
+// auth.json RelayURL > defaultRelay。否则 unit 会把自托管地址写成上游默认值。
+func TestInstallAutoStartResolvesRelayWithoutKeySetup(t *testing.T) {
+	const (
+		selfHosted = "https://relay.selfhosted.test"
+		deviceURL  = "https://relay.device.test"
+		explicit   = "https://relay.explicit.test"
+	)
+
+	tests := []struct {
+		name      string
+		deviceURL string
+		authURL   string
+		relayArg  string
+		want      string
+	}{
+		{
+			name:      "auth.json wins when device has no relay",
+			deviceURL: "",
+			authURL:   selfHosted,
+			relayArg:  defaultRelay,
+			want:      selfHosted,
+		},
+		{
+			name:      "device relay wins over auth.json",
+			deviceURL: deviceURL,
+			authURL:   selfHosted,
+			relayArg:  defaultRelay,
+			want:      deviceURL,
+		},
+		{
+			name:      "explicit relay wins over both",
+			deviceURL: deviceURL,
+			authURL:   selfHosted,
+			relayArg:  explicit,
+			want:      explicit,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			withTempConfigDir(t)
+			if err := saveDeviceConfig(&DeviceConfig{
+				DeviceName: "box", RelayURL: tc.deviceURL, Subdomain: "s1", HostID: "s1",
+				AuthUser: "u", AuthPassword: "p",
+				KeyWrapped: "wrapped", KeySalt: "salt", KeyKdf: keyKdfScrypt,
+			}); err != nil {
+				t.Fatalf("saveDeviceConfig: %v", err)
+			}
+			if err := saveAuthConfig(&AuthConfig{RelayURL: tc.authURL, Token: "tok"}); err != nil {
+				t.Fatalf("saveAuthConfig: %v", err)
+			}
+
+			var gotRelay string
+			old := setupAutoStart
+			setupAutoStart = func(localPort, relay string, attach bool) error {
+				gotRelay = relay
+				return nil
+			}
+			t.Cleanup(func() { setupAutoStart = old })
+
+			if err := installAutoStart(startOptions{}, tc.relayArg, "box", "5000"); err != nil {
+				t.Fatalf("installAutoStart: %v", err)
+			}
+			if gotRelay != tc.want {
+				t.Fatalf("relay = %q, want %q", gotRelay, tc.want)
+			}
+			if gotRelay == defaultRelay && tc.want != defaultRelay {
+				t.Fatalf("unit would point at %q instead of %q", defaultRelay, tc.want)
 			}
 		})
 	}

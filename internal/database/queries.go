@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/zero469/opencode-relay-server/internal/models"
@@ -46,6 +47,65 @@ func (db *DB) GetUserByEmail(email string) (*models.User, error) {
 		return nil, err
 	}
 	return user, nil
+}
+
+func (db *DB) ListUsers() ([]*models.User, error) {
+	rows, err := db.Query(
+		"SELECT id, email, password_hash, created_at, updated_at FROM users ORDER BY id",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []*models.User
+	for rows.Next() {
+		user := &models.User{}
+		if err := rows.Scan(&user.ID, &user.Email, &user.PasswordHash, &user.CreatedAt, &user.UpdatedAt); err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	return users, rows.Err()
+}
+
+func (db *DB) UpdateUserEmail(id int64, email string) error {
+	result, err := db.Exec("UPDATE users SET email = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", email, id)
+	if err != nil {
+		if isUniqueConstraintViolation(err) {
+			return ErrUserEmailTaken
+		}
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+func (db *DB) UpdateUserPassword(id int64, passwordHash string) error {
+	result, err := db.Exec("UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", passwordHash, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+// isUniqueConstraintViolation matches the SQLite driver's exact phrase so that
+// unrelated errors mentioning "unique" are not reported as email conflicts.
+func isUniqueConstraintViolation(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unique constraint failed")
 }
 
 func (db *DB) CreateDevice(userID int64, name, subdomain, authUser, authPassword string) (*models.Device, error) {

@@ -1,6 +1,8 @@
 package services_test
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -272,5 +274,67 @@ func TestDeviceService_GetFrpcConfig(t *testing.T) {
 
 	if frpcConfig.LocalPort != "4096" {
 		t.Errorf("GetFrpcConfig() LocalPort = %v, want 4096", frpcConfig.LocalPort)
+	}
+}
+
+func TestDeviceService_GetFrpcConfig_MissingConfig(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	auth := services.NewAuthService(db, "test-secret", false)
+	createTestVerificationCode(t, db, "frpc-missing@example.com", "654321")
+	user, err := auth.Register("frpc-missing@example.com", "password123", "654321")
+	if err != nil {
+		t.Fatalf("failed to register test user: %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		cfg         *config.Config
+		wantMissing []string
+	}{
+		{
+			name:        "all frps fields missing",
+			cfg:         &config.Config{},
+			wantMissing: []string{"FRPS_HOST", "FRPS_PORT", "FRPS_DOMAIN"},
+		},
+		{
+			name:        "only host missing",
+			cfg:         &config.Config{FrpsPort: "7000", Domain: "example.com"},
+			wantMissing: []string{"FRPS_HOST"},
+		},
+		{
+			name:        "only port missing",
+			cfg:         &config.Config{FrpsHost: "frps.example.com", Domain: "example.com"},
+			wantMissing: []string{"FRPS_PORT"},
+		},
+		{
+			name:        "only domain missing",
+			cfg:         &config.Config{FrpsHost: "frps.example.com", FrpsPort: "7000"},
+			wantMissing: []string{"FRPS_DOMAIN"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deviceSvc := services.NewDeviceService(db, tt.cfg)
+			device, err := deviceSvc.Register(user.ID, "Host")
+			if err != nil {
+				t.Fatalf("Register() unexpected error = %v", err)
+			}
+
+			got, err := deviceSvc.GetFrpcConfig(user.ID, device.ID, "4096")
+			if err == nil {
+				t.Fatalf("GetFrpcConfig() expected error, got config %+v", got)
+			}
+			if !errors.Is(err, services.ErrFrpsConfigMissing) {
+				t.Errorf("GetFrpcConfig() error = %v, want errors.Is(..., ErrFrpsConfigMissing)", err)
+			}
+			for _, name := range tt.wantMissing {
+				if !strings.Contains(err.Error(), name) {
+					t.Errorf("GetFrpcConfig() error = %q, want it to name %s", err.Error(), name)
+				}
+			}
+		})
 	}
 }

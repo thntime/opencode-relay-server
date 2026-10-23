@@ -1,9 +1,21 @@
 package database
 
 import (
+	"errors"
 	"time"
 
 	"github.com/zero469/opencode-relay-server/internal/models"
+)
+
+// ErrUserNotFound is returned when an update targets a user that does not exist.
+var ErrUserNotFound = errors.New("user not found")
+
+// ErrUserEmailTaken is returned when an update would duplicate an existing email.
+var ErrUserEmailTaken = errors.New("email already in use")
+
+var (
+	_ Database = (*DB)(nil)
+	_ Database = (*MongoDB)(nil)
 )
 
 // Database defines the interface for all database operations
@@ -14,6 +26,9 @@ type Database interface {
 	CreateUser(email, passwordHash string) (*models.User, error)
 	GetUserByID(id int64) (*models.User, error)
 	GetUserByEmail(email string) (*models.User, error)
+	ListUsers() ([]*models.User, error)
+	UpdateUserEmail(id int64, email string) error
+	UpdateUserPassword(id int64, passwordHash string) error
 
 	// Device operations
 	CreateDevice(userID int64, name, subdomain, authUser, authPassword string) (*models.Device, error)

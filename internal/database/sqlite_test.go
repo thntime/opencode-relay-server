@@ -2,6 +2,7 @@ package database_test
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync/atomic"
@@ -86,6 +87,143 @@ func TestSQLiteHostStore(t *testing.T) {
 	defer db.Close()
 
 	runHostStoreTests(t, db)
+}
+
+func TestSQLiteUpdateUserEmail(t *testing.T) {
+	db, err := database.NewSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLite() error = %v", err)
+	}
+	defer db.Close()
+
+	user, err := db.CreateUser("old-"+uniqueSuffix()+"@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser() error = %v", err)
+	}
+
+	newEmail := "new-" + uniqueSuffix() + "@example.com"
+	if err := db.UpdateUserEmail(user.ID, newEmail); err != nil {
+		t.Fatalf("UpdateUserEmail() error = %v", err)
+	}
+
+	updated, err := db.GetUserByEmail(newEmail)
+	if err != nil {
+		t.Fatalf("GetUserByEmail(new) error = %v", err)
+	}
+	if updated.ID != user.ID {
+		t.Errorf("GetUserByEmail(new).ID = %d, want %d", updated.ID, user.ID)
+	}
+	if _, err := db.GetUserByEmail(user.Email); !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("GetUserByEmail(old) error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestSQLiteUpdateUserPassword(t *testing.T) {
+	db, err := database.NewSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLite() error = %v", err)
+	}
+	defer db.Close()
+
+	user, err := db.CreateUser("pw-"+uniqueSuffix()+"@example.com", "old-hash")
+	if err != nil {
+		t.Fatalf("CreateUser() error = %v", err)
+	}
+
+	if err := db.UpdateUserPassword(user.ID, "new-hash"); err != nil {
+		t.Fatalf("UpdateUserPassword() error = %v", err)
+	}
+
+	updated, err := db.GetUserByID(user.ID)
+	if err != nil {
+		t.Fatalf("GetUserByID() error = %v", err)
+	}
+	if updated.PasswordHash != "new-hash" {
+		t.Errorf("PasswordHash = %q, want %q", updated.PasswordHash, "new-hash")
+	}
+}
+
+func TestSQLiteUpdateUserNotFound(t *testing.T) {
+	db, err := database.NewSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLite() error = %v", err)
+	}
+	defer db.Close()
+
+	if err := db.UpdateUserEmail(999999, "missing@example.com"); !errors.Is(err, database.ErrUserNotFound) {
+		t.Errorf("UpdateUserEmail() error = %v, want ErrUserNotFound", err)
+	}
+	if err := db.UpdateUserPassword(999999, "hash"); !errors.Is(err, database.ErrUserNotFound) {
+		t.Errorf("UpdateUserPassword() error = %v, want ErrUserNotFound", err)
+	}
+}
+
+func TestSQLiteUpdateUserEmailConflict(t *testing.T) {
+	db, err := database.NewSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLite() error = %v", err)
+	}
+	defer db.Close()
+
+	first, err := db.CreateUser("first-"+uniqueSuffix()+"@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser(first) error = %v", err)
+	}
+	second, err := db.CreateUser("second-"+uniqueSuffix()+"@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser(second) error = %v", err)
+	}
+
+	err = db.UpdateUserEmail(second.ID, first.Email)
+	if err == nil {
+		t.Fatal("UpdateUserEmail() error = nil, want unique conflict")
+	}
+	if !errors.Is(err, database.ErrUserEmailTaken) {
+		t.Fatalf("UpdateUserEmail() error = %v, want ErrUserEmailTaken", err)
+	}
+}
+
+func TestSQLiteUpdateUserTouchesUpdatedAt(t *testing.T) {
+	db, err := database.NewSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLite() error = %v", err)
+	}
+	defer db.Close()
+
+	user, err := db.CreateUser("touch-"+uniqueSuffix()+"@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser() error = %v", err)
+	}
+
+	const oldTS = "2000-01-01 00:00:00"
+	if _, err := db.Exec("UPDATE users SET updated_at = ? WHERE id = ?", oldTS, user.ID); err != nil {
+		t.Fatalf("reset updated_at error = %v", err)
+	}
+
+	if err := db.UpdateUserEmail(user.ID, "touch-new-"+uniqueSuffix()+"@example.com"); err != nil {
+		t.Fatalf("UpdateUserEmail() error = %v", err)
+	}
+	updated, err := db.GetUserByID(user.ID)
+	if err != nil {
+		t.Fatalf("GetUserByID() error = %v", err)
+	}
+	if !updated.UpdatedAt.After(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("UpdatedAt after UpdateUserEmail = %v, want it refreshed", updated.UpdatedAt)
+	}
+
+	if _, err := db.Exec("UPDATE users SET updated_at = ? WHERE id = ?", oldTS, user.ID); err != nil {
+		t.Fatalf("reset updated_at error = %v", err)
+	}
+	if err := db.UpdateUserPassword(user.ID, "new-hash"); err != nil {
+		t.Fatalf("UpdateUserPassword() error = %v", err)
+	}
+	updated, err = db.GetUserByID(user.ID)
+	if err != nil {
+		t.Fatalf("GetUserByID() error = %v", err)
+	}
+	if !updated.UpdatedAt.After(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("UpdatedAt after UpdateUserPassword = %v, want it refreshed", updated.UpdatedAt)
+	}
 }
 
 func TestSQLiteMigratesLegacyDevicesTable(t *testing.T) {

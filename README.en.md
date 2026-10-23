@@ -215,6 +215,35 @@ Supported flags: `-port`, `-relay`, `--name`, `--token`, `--email`, `--password`
 - Without a passphrase (`--passphrase`, `OPENCODE_TUNNEL_PASSPHRASE`, or an interactive prompt) and without a TTY, `--install` exits non-zero instead of silently installing a host that cannot report its E2E key.
 - A normal `start` still works without a passphrase, but skips key reporting and prints a warning (`未提供 E2E 口令…跳过密钥上报；隧道仍可建立`); until a key is reported, the tunnel itself is not end-to-end encrypted.
 
+On Linux, `--install` writes `~/.config/systemd/user/opencode-relay.service` and runs `systemctl --user enable`. The unit records the **resolved** relay address and the local-reuse mode in `ExecStart`, for example:
+
+```ini
+[Service]
+ExecStart=/home/you/.local/bin/opencode-tunnel start -relay https://your-relay.example.com --attach -port 4096
+Restart=always
+RestartSec=5
+```
+
+- Without an explicit `-relay`, the default address is written out rather than omitted.
+- `--attach` appears only if it was used at install time.
+- With `--attach` in the unit, an OpenCode instance must already be listening on `--port` (4096 in the example) after boot. Otherwise the client only probes, fails, and exits, and `Restart=always` turns that into an endless restart loop. Make sure OpenCode starts before this service — for example a separate systemd unit for OpenCode plus `After=` (and `Wants=` if needed) on this one.
+- After changing the relay address or the attach mode, run `--install` again; an installed unit is never updated automatically.
+- To keep the service running after you log out, enable linger first:
+
+```bash
+loginctl enable-linger "$USER"
+systemctl --user status opencode-relay.service
+```
+
+- The passphrase is never written into the unit. To supply one at boot, add an `EnvironmentFile` pointing at a restricted file (mode `600`, containing e.g. `OPENCODE_TUNNEL_PASSPHRASE=change-me`):
+
+```ini
+[Service]
+EnvironmentFile=%h/.config/opencode-tunnel/env
+```
+
+Re-running `--install` overwrites the unit, so a hand-added `EnvironmentFile` must be added back.
+
 ### Configuration files
 
 Located in `~/.opencode-tunnel/`:
@@ -259,12 +288,126 @@ You can also use the Docker Hub image directly; see [Run the server from Docker 
 | `RELAY_LEGACY_PROXY` | `false` | Re-enable the deprecated, unauthenticated `/proxy/*` route |
 | `RESEND_API_KEY` | empty | Resend API key used to send verification emails |
 | `EMAIL_FROM` | `OpenCode <noreply@liuyao16.dpdns.org>` | Verification email sender |
-| `ADMIN_EMAIL` | empty | Optional admin email |
-| `ADMIN_PASSWORD` | empty | Optional admin password |
-| `FRPS_HOST` | `127.0.0.1` | frp server host (legacy deployment compatibility) |
-| `FRPS_PORT` | `7000` | frp server port |
+| `ADMIN_EMAIL` | empty | Optional admin email; only used to create the admin on the first start against an empty database (see [Admin account](#admin-account)) |
+| `ADMIN_PASSWORD` | empty | Optional admin password; only used on the first start against an empty database |
+| `FRPS_HOST` | empty | frps host **handed to clients**; frpc-config returns 503 when unset |
+| `FRPS_PORT` | empty | frps port **handed to clients**; frpc-config returns 503 when unset |
 | `FRPS_TOKEN` | empty | frp auth token |
-| `FRPS_DOMAIN` | `liuyao16.dpdns.org` | frp domain |
+| `FRPS_DOMAIN` | empty | frp domain **handed to clients**; frpc-config returns 503 when unset |
+
+> `FRPS_HOST` / `FRPS_PORT` / `FRPS_DOMAIN` describe the **frps endpoint that clients connect to**, not an address the relay container itself listens on. The relay only copies these values into the frpc configuration it serves.
+
+### Upgrading from an older version (BREAKING)
+
+The defaults for these three variables changed from built-in values (`127.0.0.1` / `7000` / the upstream author's domain) to **empty**. After upgrading, if they are not configured explicitly:
+
+- `GET /api/devices/{id}/frpc-config` returns **503** and names the missing variable; clients therefore cannot obtain an frpc configuration and the tunnel will not come up.
+- A missing device still returns **404**, keeping "server misconfigured" separate from "device not found".
+
+The built-in defaults belonged to the upstream author's deployment and are wrong for any self-hosted instance, so the server fails loudly instead of silently serving a bad address. Minimal configuration (the full file is `docker-compose.example.yml` in this repository):
+
+```yaml
+services:
+  relay:
+    image: thntime/opencode-relay-server:latest
+    container_name: opencode-relay
+    ports:
+      - "14096:8080"
+    environment:
+      PORT: "8080"
+      JWT_SECRET: change-me
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: change-me
+      FRPS_HOST: frps.example.com
+      FRPS_PORT: "7000"
+      FRPS_DOMAIN: example.com
+    volumes:
+      - relay-data:/home/data
+
+volumes:
+  relay-data:
+```
+
+`FRPS_HOST` is the frps address reachable by clients, `FRPS_PORT` is frps `bind_port`, and `FRPS_DOMAIN` is frps `subdomain_host`.
+
+> The snippet keeps the example's mapping: host **14096** → container **8080** (the healthcheck still uses 8080 inside the container, so it is unaffected). If you changed it to `8080:8080`, replace `14096` in the commands below with `8080`.
+
+Redeploy and verify:
+
+```bash
+# 1. Prepare your own docker-compose.yml from docker-compose.example.yml and fill in real values
+# 2. Recreate the container so the new environment variables take effect
+docker compose up -d
+
+# 3. Check the health status
+docker compose ps
+
+# 4. Confirm the served config with a real device ID and token (200 plus frps addresses when configured)
+#    14096 is the host port mapped by the example; substitute your own
+curl -i -H "Authorization: Bearer $RELAY_TOKEN" \
+  http://127.0.0.1:14096/api/devices/<device-id>/frpc-config
+```
+
+### Container proxy and healthcheck
+
+If the host routes container traffic through `HTTP_PROXY` / `HTTPS_PROXY`, the BusyBox `wget` healthcheck goes through the proxy too — even with `NO_PROXY=127.0.0.1`, because BusyBox `wget` does not honor `NO_PROXY`. The usual symptom: `/api/health` works from the host while the container stays `unhealthy`, and the health log shows a 502 from the proxy.
+
+The healthcheck in `docker-compose.example.yml` uses `wget -Y off` to bypass the proxy for **that single command**; other outbound traffic in the container (sending email, reaching frps) still follows the proxy settings:
+
+```yaml
+healthcheck:
+  test: ["CMD", "wget", "-Y", "off", "-qO-", "http://127.0.0.1:8080/api/health"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+```
+
+Diagnose and verify:
+
+```bash
+# Container health status
+docker inspect --format '{{.State.Health.Status}}' opencode-relay
+
+# Bypass the proxy and hit the health endpoint directly (should print JSON)
+docker exec opencode-relay wget -Y off -qO- http://127.0.0.1:8080/api/health
+
+# Contrast: without -Y off, this usually fails or returns a proxy error when a proxy is configured
+docker exec opencode-relay wget -qO- http://127.0.0.1:8080/api/health
+```
+
+`-Y off` depends on BusyBox `wget`; the runtime image is Alpine-based, so re-check the flag if the base image ever changes.
+
+### Admin account
+
+`ADMIN_EMAIL` / `ADMIN_PASSWORD` only create the admin on the **first start against an empty database**. `EnsureAdminUser` looks the user up by email: if the email does not exist it creates the user, otherwise it does nothing.
+
+Consequently:
+
+- Changing `ADMIN_EMAIL` and restarting **creates a new user** instead of renaming the existing admin; the old user remains and the old email still works.
+- Changing `ADMIN_PASSWORD` does **not** update the password of an existing email.
+
+To fix an existing account, use the `users` subcommand built into the server binary (it talks to the database directly, not over HTTP; it needs database credentials and is an operator action):
+
+```bash
+# List all users
+docker exec opencode-relay /app/opencode-relay-server users list
+
+# Change an email (old@example.com must already exist)
+docker exec opencode-relay /app/opencode-relay-server users set-email old@example.com new@example.com
+
+# Reset a password (interactive, entered twice, not echoed)
+docker exec -it opencode-relay /app/opencode-relay-server users set-password new@example.com
+
+# For scripts, use --password (note that shell history and the process list expose it)
+docker exec opencode-relay /app/opencode-relay-server users set-password new@example.com --password 'change-me'
+```
+
+The binary lives at `/app/opencode-relay-server` in the image (see `Dockerfile`). A binary you build yourself may have a different name (for example `go build -o server ./cmd/server`), so replace the path with the actual one inside your image. Both SQLite and MongoDB backends are supported.
+
+After renaming an email with `users set-email`, two more places must be handled or the change only looks applied:
+
+- **Update `ADMIN_EMAIL` in your compose file.** If the environment variable still holds the old address, the next restart makes `EnsureAdminUser` treat the old email as missing and **create another user**, leaving both accounts in the database. Update `ADMIN_EMAIL` to the new value right away (`ADMIN_PASSWORD` is only used when creating a user, so it is not part of this).
+- **Log the client in again.** `~/.opencode-tunnel/auth.json` still records the old email: the JWT keeps working and the tunnel stays up, but the email shown by `opencode-tunnel status` no longer matches the account, and a later re-login with the old address fails. Run `opencode-tunnel logout` to clear the local credentials, then `opencode-tunnel start --email new@example.com` (enter the password interactively, or add `--password`) to refresh `auth.json`.
 
 ### Deploy to fly.io
 
@@ -473,13 +616,54 @@ The Release, Docker image, and npm package for the same tag share the same versi
 |--------|---------|
 | `DOCKERHUB_USERNAME` | Docker Hub username (the current image namespace is `thntime`) |
 | `DOCKERHUB_TOKEN` | Docker Hub access token with Read & Write permission |
-| `NPM_TOKEN` | npm granular access token with Read and write permission |
+| `NPM_TOKEN` | npm granular access token with Read and write permission; delete it after migrating to Trusted Publishing (see below) |
+
+### npm publish credentials and the Trusted Publishing migration
+
+Current state (not migrated yet):
+
+- npm publishes use a **Granular Access Token** (`NPM_TOKEN`) and rely on that token's **Bypass 2FA** capability to publish from CI without interaction.
+- npm has announced that granular access tokens will lose the ability to bypass 2FA in **January 2027**. After that date the current `NPM_TOKEN` flow will fail and the npm job in `release.yml` will break.
+- This change only documents the state and the migration path; it does not modify `.github/workflows/release.yml`.
+
+Steps to migrate to **Trusted Publishing** (GitHub OIDC, no long-lived token).
+
+The `publish-npm` job currently runs `Setup Node.js` → `Check npm token` → `Update package version` → `Publish to npm`. `Check npm token` exits with `1` whenever `NODE_AUTH_TOKEN` is empty, so that step **must be deleted explicitly**; adding OIDC permissions alone leaves the first tag publish failing hard.
+
+1. **Register the publisher on npm**: `@thntime/opencode-tunnel` → Settings → Trusted Publisher → GitHub Actions, and fill in the repository (org/repo) plus the workflow filename `release.yml`. `publish-npm` has no `environment:` today, so leave Environment empty; if you later add an environment to that job, it must match here.
+2. **Grant OIDC permission to the `publish-npm` job only** — leave the `release` job's `contents: write` alone:
+
+   ```yaml
+   publish-npm:
+     needs: release
+     runs-on: ubuntu-latest
+     permissions:
+       id-token: write
+       contents: read
+   ```
+
+   The workflow-level `permissions: contents: read` is **overridden wholesale** by a job-level block, so `contents: read` has to be repeated (checkout needs it). Do not change the top-level permissions — that would hand OIDC tokens to every job, including test and build.
+3. **Remove the token wiring**: delete the whole `Check npm token` step and drop `env: NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` from `Publish to npm`. `registry-url: 'https://registry.npmjs.org'` in `Setup Node.js` may stay: it only writes the registry into `.npmrc` and no longer performs token authentication.
+4. **Make sure the publish environment has npm ≥ 11.5.1**: `actions/setup-node@v4` with Node 20 ships npm 10.x, which Trusted Publishing does not support. Add a step after `Setup Node.js` that upgrades and asserts the version:
+
+   ```yaml
+   - name: Use npm that supports Trusted Publishing
+     run: |
+       npm install -g npm@latest
+       npm --version
+       node -e 'const v=require("child_process").execSync("npm --version").toString().trim();const [a,b,c]=v.split(".").map(Number);if(a<11||(a===11&&b<5)||(a===11&&b===5&&c<1)){console.error("npm "+v+" < 11.5.1");process.exit(1)}'
+   ```
+
+   Prefer adding `--provenance` to `npm publish`: provenance is generated automatically under Trusted Publishing, but spelling it out makes the dependency obvious.
+5. **Verify, then delete the secret**: do a full publish from a test tag, confirm provenance and the source repository appear on the npm package page, then delete the `NPM_TOKEN` repository secret and update the "Required GitHub Secrets" table above.
+
+Prerequisites: the npm package already exists and your account may publish it; the GitHub repository allows Actions to request OIDC tokens; the workflow is triggered from the repository and filename registered on npm.
 
 ### Prerequisites
 
 - The Docker Hub repository `thntime/opencode-relay-server` exists.
 - The npm scope `@thntime` is available; if your actual scope differs, update `name` in `npm/opencode-tunnel/package.json` and the install commands in this document.
-- The GitHub repository has the three secrets above.
+- The GitHub repository has the secrets above (`NPM_TOKEN` may be deleted once Trusted Publishing is in place).
 
 ### Release steps
 

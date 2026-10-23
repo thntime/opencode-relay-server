@@ -1,10 +1,16 @@
 package services
 
 import (
+	"errors"
+	"fmt"
+	"strings"
+
 	"github.com/zero469/opencode-relay-server/internal/config"
 	"github.com/zero469/opencode-relay-server/internal/database"
 	"github.com/zero469/opencode-relay-server/internal/models"
 )
+
+var ErrFrpsConfigMissing = errors.New("frps configuration is missing")
 
 type DeviceService struct {
 	db  database.Database
@@ -75,6 +81,20 @@ func (s *DeviceService) GetFrpcConfig(userID, deviceID int64, localPort string) 
 	device, err := s.Get(userID, deviceID)
 	if err != nil {
 		return nil, err
+	}
+
+	var missing []string
+	if s.cfg.FrpsHost == "" {
+		missing = append(missing, "FRPS_HOST")
+	}
+	if s.cfg.FrpsPort == "" {
+		missing = append(missing, "FRPS_PORT")
+	}
+	if s.cfg.Domain == "" {
+		missing = append(missing, "FRPS_DOMAIN")
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("%w: %s", ErrFrpsConfigMissing, strings.Join(missing, ", "))
 	}
 
 	return &models.FrpcConfig{

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -131,6 +132,10 @@ func (h *DeviceHandler) GetFrpcConfig(w http.ResponseWriter, r *http.Request) {
 
 	config, err := h.deviceService.GetFrpcConfig(userID, deviceID, localPort)
 	if err != nil {
+		if errors.Is(err, services.ErrFrpsConfigMissing) {
+			writeError(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		writeError(w, "device not found", http.StatusNotFound)
 		return
 	}

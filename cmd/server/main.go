@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -19,25 +20,26 @@ import (
 func main() {
 	cfg := config.Load()
 
-	var db database.Database
-	var err error
-
-	mongoURI := os.Getenv("MONGODB_URI")
-	if mongoURI != "" {
-		log.Printf("Connecting to MongoDB...")
-		db, err = database.NewMongoDB(mongoURI)
+	if len(os.Args) > 1 && os.Args[1] == "users" {
+		db, closeDB, err := openDatabase(cfg)
 		if err != nil {
-			log.Fatalf("Failed to connect to MongoDB: %v", err)
+			log.Printf("Failed to open database: %v", err)
+			os.Exit(1)
 		}
-		log.Printf("Connected to MongoDB successfully")
-	} else {
-		log.Printf("Using SQLite database: %s", cfg.DatabasePath)
-		db, err = database.NewSQLite(cfg.DatabasePath)
-		if err != nil {
-			log.Fatalf("Failed to connect to SQLite: %v", err)
+		runErr := runUsersCommand(os.Args[2:], db, os.Stdout)
+		closeDB()
+		if runErr != nil {
+			log.Printf("users: %v", runErr)
+			os.Exit(1)
 		}
+		return
 	}
-	defer db.Close()
+
+	db, closeDB, err := openDatabase(cfg)
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	defer closeDB()
 
 	if count, err := db.MarkAllDevicesOffline(); err != nil {
 		log.Printf("Warning: failed to mark devices offline on startup: %v", err)
@@ -153,6 +155,31 @@ func main() {
 	if err := http.ListenAndServe(":"+cfg.Port, handler); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
+}
+
+// openDatabase connects to MongoDB when MONGODB_URI is set, otherwise to SQLite.
+// The returned function closes the connection and is safe to call once.
+func openDatabase(cfg *config.Config) (database.Database, func(), error) {
+	var db database.Database
+	var err error
+
+	mongoURI := os.Getenv("MONGODB_URI")
+	if mongoURI != "" {
+		log.Printf("Connecting to MongoDB...")
+		db, err = database.NewMongoDB(mongoURI)
+		if err != nil {
+			return nil, nil, fmt.Errorf("connect to MongoDB: %w", err)
+		}
+		log.Printf("Connected to MongoDB successfully")
+	} else {
+		log.Printf("Using SQLite database: %s", cfg.DatabasePath)
+		db, err = database.NewSQLite(cfg.DatabasePath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("connect to SQLite: %w", err)
+		}
+	}
+
+	return db, func() { _ = db.Close() }, nil
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

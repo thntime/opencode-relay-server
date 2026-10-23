@@ -21,5 +21,8 @@ relay-server
 # Local env
 .env
 
+# Local docker compose with real secrets (copied from docker-compose.example.yml)
+docker-compose.yml
+
 # Node dependencies
 node_modules/

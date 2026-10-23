@@ -1,0 +1,73 @@
+# OpenCode Relay Server — docker compose 示例
+#
+# 用途：可直接复制为本机部署文件的脱敏模板。
+#
+# 使用：
+#   1. cp docker-compose.example.yml docker-compose.yml
+#   2. 修改下面所有 "change-me" / example.com 占位符，尤其是 JWT_SECRET 与 ADMIN_PASSWORD
+#   3. docker compose up -d
+#   4. docker compose ps   # 等待状态变为 healthy
+#
+# 注意：
+# - 复制为 docker-compose.yml 后，该文件已被仓库根 .gitignore 忽略（示例文件名
+#   不同，因此本文件本身仍受版本控制）。但忽略规则只是防线：不要把含真实密钥的
+#   副本提交到任何地方，也不要贴进 issue、日志或聊天记录。
+# - PORT 必须与端口映射和 healthcheck 的 8080 一致；镜像自身默认监听 3000。
+# - 数据持久化在命名卷 relay-data，对应容器内 /home/data。
+
+services:
+  relay:
+    image: thntime/opencode-relay-server:latest
+    container_name: opencode-relay
+    restart: unless-stopped
+    # 宿主机 14096 → 容器 8080。宿主机侧访问用 http://127.0.0.1:14096；
+    # healthcheck 在容器内访问，所以仍用 8080。改宿主端口时请同步 README 的验证命令。
+    ports:
+      - "14096:8080"
+    environment:
+      PORT: "8080"
+      JWT_SECRET: "change-me-to-a-long-random-string"
+      DATABASE_PATH: "/home/data/relay.db"
+
+      # frps 地址：这三个变量是「下发给客户端」的 frps 地址，不是 relay 容器
+      # 自身的监听地址，因此必须是**客户端可达**的地址（宿主机或外部 frps 的公网
+      # 域名/IP）。填 127.0.0.1 只会让客户端连到它自己，隧道必然失败。
+      # 留空（未配置）时 /api/devices/{id}/frpc-config 返回 503，客户端拿不到
+      # frpc 配置；FRPS_DOMAIN 应与 FRPS_HOST 同域（frps 的 subdomain_host）。
+      FRPS_HOST: "frps.example.com"
+      FRPS_PORT: "7000"
+      FRPS_TOKEN: ""
+      FRPS_DOMAIN: "example.com"
+
+      # 邮件验证（Resend）。留空则无法发送验证码，仅预创建管理员账号可用。
+      RESEND_API_KEY: ""
+      EMAIL_FROM: "noreply@example.com"
+
+      # 初始管理员账号：两者都设置时，启动时自动创建。
+      # 注意：ADMIN_EMAIL 只对空库生效，改邮箱会新增用户而不是更新已有用户。
+      ADMIN_EMAIL: "admin@example.com"
+      ADMIN_PASSWORD: "change-me"
+
+      # 单用户模式：true 时跳过邮箱验证，可用 /api/auto-login
+      SINGLE_USER_MODE: "false"
+
+      # 兼容旧的无认证 /proxy/* 路由，默认关闭
+      RELAY_LEGACY_PROXY: "false"
+
+    volumes:
+      - relay-data:/home/data
+
+    # healthcheck 直接访问容器内自身端点。
+    # -Y off 只让这一条 wget 命令忽略容器内的 HTTP_PROXY/HTTPS_PROXY：
+    # BusyBox wget 会读取代理变量，NO_PROXY=127.0.0.1 对它无效。该参数不改动
+    # 容器的其它网络行为（如访问 frps、发送邮件仍可走代理）。
+    # 依赖 BusyBox wget 的 -Y 参数；更换基础镜像时需同步调整。
+    healthcheck:
+      test: ["CMD", "wget", "-Y", "off", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  relay-data:

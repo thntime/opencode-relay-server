@@ -914,6 +914,21 @@ func prepareLocalServer(opts startOptions, localPort string) error {
 // and it fails loudly when key wrapping needs a passphrase it cannot obtain.
 func installAutoStart(opts startOptions, relay, name, localPort string) error {
 	device := loadExistingDevice(opts.Reset)
+
+	// Resolve the relay once, before deciding whether key setup is needed:
+	// an existing complete device must still record the self-hosted relay in
+	// the unit. Priority: explicit -relay > device.RelayURL > auth.json > default.
+	if relay == "" {
+		relay = defaultRelay
+	}
+	if relay == defaultRelay {
+		if device != nil && device.RelayURL != "" {
+			relay = device.RelayURL
+		} else if auth, err := loadAuth(); err == nil && auth.RelayURL != "" {
+			relay = auth.RelayURL
+		}
+	}
+
 	// Key setup is needed when the identity or key material is incomplete, and
 	// also when --rewrap explicitly asks for fresh wrapped material even though
 	// the existing identity is complete.
@@ -924,9 +939,6 @@ func installAutoStart(opts startOptions, relay, name, localPort string) error {
 		auth, err := resolveAuth(relay, opts)
 		if err != nil {
 			return fmt.Errorf("resolve credentials: %w", err)
-		}
-		if relay == defaultRelay && auth.RelayURL != "" {
-			relay = auth.RelayURL
 		}
 		if device == nil || device.HostID == "" {
 			device, err = ensureHost(relay, auth.Token, name, opts.Reset)
@@ -939,7 +951,9 @@ func installAutoStart(opts startOptions, relay, name, localPort string) error {
 		}
 	}
 
-	if err := setupAutoStart(localPort); err != nil {
+	// relay 与 --attach 是本次安装解析后的结果，必须一起写进 unit，否则开机
+	// 自启会退回默认 relay / 重新拉起 opencode，与安装时的配置不一致。
+	if err := setupAutoStart(localPort, relay, opts.Attach); err != nil {
 		return fmt.Errorf("setup autostart: %w", err)
 	}
 	fmt.Printf("✓ 已配置开机自启（端口 %s）\n", localPort)
@@ -1027,7 +1041,9 @@ func cmdPair() {
 	}
 
 	fmt.Printf("\n✓ Device \"%s\" paired successfully!\n", device.DeviceName)
-	setupAutoStart(localPort)
+	if err := setupAutoStart(localPort, relay, false); err != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠ 配置开机自启失败: %v\n", err)
+	}
 }
 
 // ensureOpenCodeRunning is a package-level var so tests can stub the spawn path.
@@ -3079,6 +3095,9 @@ func loadAuthConfig() (*AuthConfig, error) {
 	return &config, nil
 }
 
+// loadAuth is a package-level var so tests can stub credential lookups.
+var loadAuth = loadAuthConfig
+
 func saveAuthConfig(config *AuthConfig) error {
 	dir := getConfigDir()
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -3119,13 +3138,18 @@ func saveDeviceConfig(config *DeviceConfig) error {
 	return os.WriteFile(filepath.Join(dir, deviceFileName), data, 0600)
 }
 
+// osExecutable is a seam so tests can simulate a failing executable lookup.
+var osExecutable = os.Executable
+
 // setupAutoStart is a package-level var so tests can observe the install call.
-var setupAutoStart = func(localPort string) error {
+// relay/attach are only consumed by the systemd unit; the launchd and Windows
+// task entries keep their existing port-only shape.
+var setupAutoStart = func(localPort, relay string, attach bool) error {
 	switch runtime.GOOS {
 	case "darwin":
 		return setupLaunchd(localPort)
 	case "linux":
-		return setupSystemd(localPort)
+		return setupSystemd(localPort, relay, attach)
 	case "windows":
 		return setupWindowsTask(localPort)
 	default:
@@ -3196,13 +3220,63 @@ func setupLaunchd(localPort string) error {
 	return nil
 }
 
-func setupSystemd(localPort string) error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
+// buildSystemdUnit renders the systemd user unit. relay and attach are the
+// values resolved at install time (cmdStart defaults relay to defaultRelay), so
+// the generated unit keeps connecting to the same relay after reboot. Secrets
+// are never written here: the E2E passphrase must come from the environment.
+// execPath is resolved by setupSystemd so a lookup failure can be reported
+// instead of producing a unit that cannot start.
+func buildSystemdUnit(localPort, relay string, attach bool, execPath string) string {
+	if relay == "" {
+		relay = defaultRelay
 	}
 
-	execPath, err := os.Executable()
+	args := []string{"start", "-relay", relay}
+	if attach {
+		args = append(args, "--attach")
+	}
+	args = append(args, "-port", localPort)
+
+	escaped := make([]string, len(args))
+	for i, arg := range args {
+		escaped[i] = systemdEscapeArg(arg)
+	}
+
+	return fmt.Sprintf(`[Unit]
+Description=OpenCode Anywhere Tunnel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%s %s
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`, systemdEscapeArg(execPath), strings.Join(escaped, " "))
+}
+
+// systemdEscapeArg quotes an ExecStart argument so systemd does not split it on
+// whitespace or expand "%" specifiers. systemd expands "%%" to a literal "%",
+// even inside double quotes, so every "%" is doubled first.
+func systemdEscapeArg(s string) string {
+	escaped := strings.ReplaceAll(s, "%", "%%")
+	if s != "" && !strings.ContainsAny(s, " \t\n\r\"\\%;$") {
+		return escaped
+	}
+	escaped = strings.ReplaceAll(escaped, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return `"` + escaped + `"`
+}
+
+func setupSystemd(localPort, relay string, attach bool) error {
+	execPath, err := osExecutable()
+	if err != nil {
+		return fmt.Errorf("resolve executable path: %w", err)
+	}
+
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
 	}
@@ -3214,19 +3288,7 @@ func setupSystemd(localPort string) error {
 
 	servicePath := filepath.Join(systemdDir, "opencode-relay.service")
 
-	serviceContent := fmt.Sprintf(`[Unit]
-Description=OpenCode Anywhere Tunnel
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=%s start -port %s
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-`, execPath, localPort)
+	serviceContent := buildSystemdUnit(localPort, relay, attach, execPath)
 
 	if err := os.WriteFile(servicePath, []byte(serviceContent), 0644); err != nil {
 		return err
