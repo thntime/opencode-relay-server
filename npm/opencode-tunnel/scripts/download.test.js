@@ -443,7 +443,11 @@ test('createProxyAgent returns an agent only when a proxy applies', () => {
   const target = 'http://127.0.0.1:1/x';
 
   const agent = createProxyAgent(target, { HTTP_PROXY: 'http://127.0.0.1:2' });
-  assert.notEqual(agent, null);
+  assert.notEqual(
+    agent,
+    null,
+    'createProxyAgent returned null; run `npm install` in npm/opencode-tunnel so https-proxy-agent is present'
+  );
   assert.equal(typeof agent.addRequest, 'function');
 
   // NO_PROXY wins over a configured proxy.
@@ -459,7 +463,11 @@ test('createProxyAgent returns an agent only when a proxy applies', () => {
   const httpsAgent = createProxyAgent('https://example.com/file', {
     HTTP_PROXY: 'http://127.0.0.1:2'
   });
-  assert.notEqual(httpsAgent, null);
+  assert.notEqual(
+    httpsAgent,
+    null,
+    'createProxyAgent returned null for an https target; run `npm install` in npm/opencode-tunnel'
+  );
   assert.equal(typeof httpsAgent.addRequest, 'function');
 });
 

@@ -33,5 +33,12 @@ jobs:
         with:
           node-version: '20'
 
+      # The download module resolves https-proxy-agent lazily, so the package
+      # dependencies must be present for the proxy tests to exercise it.
+      - name: Install package dependencies
+        working-directory: npm/opencode-tunnel
+        run: npm install --ignore-scripts --no-audit --no-fund
+
       - name: Run npm download tests
-        run: node --test npm/opencode-tunnel/scripts/download.test.js
+        working-directory: npm/opencode-tunnel
+        run: node --test scripts/download.test.js
