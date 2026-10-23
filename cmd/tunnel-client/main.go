@@ -105,6 +105,11 @@ type OpenCodeConfig struct {
 	WorkDir   string `json:"workdir"`
 	Port      string `json:"port,omitempty"`
 	AutoStart bool   `json:"auto_start"`
+	// AuthUser/AuthPassword are the local OpenCode server's HTTP Basic
+	// credentials. They are applied by the tunnel when forwarding, so the relay
+	// never sees them and clients never have to send them.
+	AuthUser     string `json:"auth_user,omitempty"`
+	AuthPassword string `json:"auth_password,omitempty"`
 }
 
 type LoginResponse struct {
@@ -188,6 +193,11 @@ type TunnelClient struct {
 	// req-cancel and connection teardown can abort the local request.
 	streamsMu     sync.Mutex
 	streamCancels map[string]*streamCancel
+
+	// localAuth* apply the local OpenCode server's Basic credentials to
+	// forwarded HTTP and WebSocket requests. Empty means no local auth.
+	localAuthUser     string
+	localAuthPassword string
 
 	// wsConns holds local WebSocket sessions by tunnel request ID.
 	wsMu    sync.Mutex
@@ -1500,6 +1510,10 @@ func runTunnel(config *DeviceConfig, localPort string) error {
 			Timeout: 120 * time.Second,
 		},
 	}
+	if ocConfig, err := loadOpenCodeConfig(); err == nil && ocConfig != nil {
+		client.localAuthUser = ocConfig.AuthUser
+		client.localAuthPassword = ocConfig.AuthPassword
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
@@ -2145,6 +2159,16 @@ func requestAcceptsEventStream(req *TunnelRequest) bool {
 	return false
 }
 
+// applyLocalAuth attaches the local OpenCode server's Basic credentials when
+// the tunnel config provides them. The relay strips its own Authorization
+// header, so this is the only place local credentials are added.
+func (c *TunnelClient) applyLocalAuth(h http.Header) {
+	if c == nil || c.localAuthUser == "" {
+		return
+	}
+	h.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(c.localAuthUser+":"+c.localAuthPassword)))
+}
+
 func (c *TunnelClient) setStreamMode(enabled bool) {
 	c.modeMu.Lock()
 	c.streamMode = enabled
@@ -2172,6 +2196,9 @@ func (c *TunnelClient) newLocalRequest(req *TunnelRequest) (*http.Request, int, 
 	}
 
 	httpReq, err := http.NewRequest(req.Method, localURL, bytes.NewReader(requestBody))
+	if err == nil {
+		c.applyLocalAuth(httpReq.Header)
+	}
 	if err != nil {
 		return nil, 500, "failed to create request"
 	}
@@ -2179,6 +2206,10 @@ func (c *TunnelClient) newLocalRequest(req *TunnelRequest) (*http.Request, int, 
 	for key, value := range req.Headers {
 		httpReq.Header.Set(key, value)
 	}
+	// The tunnel re-frames bodies itself (and encrypts them when E2E is on), so
+	// transport compression must never be negotiated: a compressed body would
+	// be forwarded with a stale Content-Encoding or fail to decrypt.
+	httpReq.Header.Set("Accept-Encoding", "identity")
 	return httpReq, 0, ""
 }
 
@@ -2232,6 +2263,11 @@ func (c *TunnelClient) handleRequestLegacy(req *TunnelRequest) {
 	// If encrypted, override Content-Type to text/plain so clients don't try to parse as JSON
 	if c.config.EncryptionKey != "" {
 		headers["Content-Type"] = "text/plain"
+		// The body is now ciphertext: any transport encoding the local server
+		// negotiated no longer describes it, and forwarding it makes HTTP
+		// clients try to decompress random bytes.
+		deleteHeaderFold(headers, "Content-Encoding")
+		deleteHeaderFold(headers, "Transfer-Encoding")
 	}
 
 	tunnelResp := &TunnelResponse{
@@ -2283,8 +2319,12 @@ func (c *TunnelClient) handleRequestStream(req *TunnelRequest) {
 	// only moves bytes and never needs the key (design D8). Content-Length is
 	// dropped because the relay writes the body incrementally.
 	headers := make(map[string]string, len(resp.Header))
+	encryptedStream := c.streamEncryptionKey() != ""
 	for key := range resp.Header {
 		if isHopByHopHeader(key) || strings.EqualFold(key, "Content-Length") {
+			continue
+		}
+		if encryptedStream && strings.EqualFold(key, "Content-Encoding") {
 			continue
 		}
 		headers[key] = resp.Header.Get(key)
@@ -2486,6 +2526,15 @@ func (c *TunnelClient) cancelAllStreams() {
 
 // isHopByHopHeader reports connection-scoped headers that must not be copied to
 // the local WebSocket handshake; the dialer generates its own.
+// deleteHeaderFold removes a header regardless of the casing the upstream used.
+func deleteHeaderFold(headers map[string]string, name string) {
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			delete(headers, key)
+		}
+	}
+}
+
 func isHopByHopHeader(header string) bool {
 	switch strings.ToLower(header) {
 	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -2501,7 +2550,7 @@ func isHopByHopHeader(header string) bool {
 func isBlockedLocalHeader(header string) bool {
 	lower := strings.ToLower(header)
 	switch lower {
-	case "authorization", "cookie", "x-real-ip",
+	case "authorization", "cookie", "x-real-ip", "origin",
 		"sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
 		"sec-websocket-protocol", "sec-websocket-accept", "host":
 		return true
@@ -2552,6 +2601,7 @@ func (c *TunnelClient) handleWsOpen(open *tunnel.WsOpen) {
 		}
 		header.Set(key, value)
 	}
+	c.applyLocalAuth(header)
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout:  10 * time.Second,
@@ -2561,8 +2611,13 @@ func (c *TunnelClient) handleWsOpen(open *tunnel.WsOpen) {
 	conn, resp, err := dialer.Dial(target, header)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
-			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 			resp.Body.Close()
+			safePath := path
+			if i := strings.IndexByte(safePath, '?'); i >= 0 {
+				safePath = safePath[:i]
+			}
+			debugLog("[ws] dial %s status=%d body=%q", safePath, resp.StatusCode, string(body))
 		}
 		c.dropWsSession(open.ID, sess)
 		message := err.Error()
@@ -2625,13 +2680,20 @@ func (c *TunnelClient) pumpLocalWs(id string, sess *wsSession) {
 		}
 
 		if sess.encrypted {
-			encrypted, encErr := encryptStreamPayload(data, c.streamEncryptionKey())
+			// Ciphertext must travel as a binary frame: a text frame would be
+			// UTF-8 decoded on the app side and the bytes would be lost. The
+			// original opcode is sealed inside the plaintext.
+			plain := make([]byte, len(data)+1)
+			plain[0] = byte(opcode)
+			copy(plain[1:], data)
+			encrypted, encErr := encryptStreamPayload(plain, c.streamEncryptionKey())
 			if encErr != nil {
 				log.Printf("[ws] failed to encrypt frame for %s: %v", id, encErr)
 				c.closeWsSession(id, websocket.CloseInternalServerErr, "failed to encrypt frame", true)
 				return
 			}
 			data = encrypted
+			opcode = websocket.BinaryMessage
 		}
 
 		if err := c.sendFrame(&tunnel.WsFrame{ID: id, Opcode: opcode, Data: data}); err != nil {
@@ -2662,6 +2724,7 @@ func (c *TunnelClient) handleWsFrame(frame *tunnel.WsFrame) {
 	}
 
 	data := frame.Data
+	opcode := frame.Opcode
 	if sess.encrypted {
 		plain, err := decryptStreamPayload(frame.Data, c.streamEncryptionKey())
 		if err != nil {
@@ -2669,14 +2732,23 @@ func (c *TunnelClient) handleWsFrame(frame *tunnel.WsFrame) {
 			c.closeWsSession(frame.ID, websocket.CloseInternalServerErr, "failed to decrypt frame", true)
 			return
 		}
-		data = plain
+		if len(plain) < 1 {
+			c.closeWsSession(frame.ID, websocket.CloseInternalServerErr, "empty encrypted frame", true)
+			return
+		}
+		opcode = int(plain[0])
+		data = plain[1:]
+		if opcode != websocket.TextMessage && opcode != websocket.BinaryMessage {
+			c.closeWsSession(frame.ID, websocket.CloseInternalServerErr, "invalid sealed opcode", true)
+			return
+		}
 	}
 
 	sess.writeMu.Lock()
 	var err error
 	if sess.conn != nil {
 		sess.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		err = sess.conn.WriteMessage(frame.Opcode, data)
+		err = sess.conn.WriteMessage(opcode, data)
 	}
 	sess.writeMu.Unlock()
 

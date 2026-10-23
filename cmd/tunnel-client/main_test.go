@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -2417,12 +2418,14 @@ func TestHandleWsOpenEncryptsFrames(t *testing.T) {
 	}
 	<-infoCh
 
-	// relay -> local: the relay frame carries ciphertext.
-	encrypted, err := encryptStreamPayload([]byte("ping"), testStreamKey)
+	// relay -> local: the relay frame carries ciphertext whose plaintext starts
+	// with the original opcode.
+	sealed := append([]byte{byte(websocket.TextMessage)}, []byte("ping")...)
+	encrypted, err := encryptStreamPayload(sealed, testStreamKey)
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
-	client.handleWsFrame(&tunnel.WsFrame{ID: "w1", Opcode: websocket.TextMessage, Data: encrypted})
+	client.handleWsFrame(&tunnel.WsFrame{ID: "w1", Opcode: websocket.BinaryMessage, Data: encrypted})
 
 	// local echo -> relay: the client must encrypt what the local socket sent.
 	echo, ok := nextFrame(t, frames, 5*time.Second).(*tunnel.WsFrame)
@@ -2432,12 +2435,18 @@ func TestHandleWsOpenEncryptsFrames(t *testing.T) {
 	if bytes.Equal(echo.Data, []byte("ping")) {
 		t.Fatal("ws-frame payload was forwarded in plaintext")
 	}
+	if echo.Opcode != websocket.BinaryMessage {
+		t.Fatalf("encrypted frame opcode = %d, want binary", echo.Opcode)
+	}
 	plain, err := decryptStreamPayload(echo.Data, testStreamKey)
 	if err != nil {
 		t.Fatalf("forwarded frame did not decrypt: %v", err)
 	}
-	if string(plain) != "ping" {
-		t.Fatalf("forwarded frame = %q, want ping", plain)
+	if len(plain) < 2 || plain[0] != byte(websocket.TextMessage) {
+		t.Fatalf("sealed opcode = %v, want text", plain)
+	}
+	if string(plain[1:]) != "ping" {
+		t.Fatalf("forwarded frame = %q, want ping", plain[1:])
 	}
 
 	client.handleWsClose(&tunnel.WsClose{ID: "w1", Code: websocket.CloseNormalClosure, Reason: "done"})
@@ -2542,5 +2551,34 @@ func TestWsFrameEncryptFailureCloses1011(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("local WS was not closed after the encrypt failure")
+	}
+}
+
+func TestApplyLocalAuth(t *testing.T) {
+	client := &TunnelClient{localAuthUser: "opencode", localAuthPassword: "local-secret"}
+	header := http.Header{}
+	client.applyLocalAuth(header)
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("opencode:local-secret"))
+	if got := header.Get("Authorization"); got != want {
+		t.Fatalf("Authorization = %q, want %q", got, want)
+	}
+
+	empty := &TunnelClient{}
+	other := http.Header{}
+	empty.applyLocalAuth(other)
+	if got := other.Get("Authorization"); got != "" {
+		t.Fatalf("expected no Authorization header without local credentials, got %q", got)
+	}
+}
+
+func TestNewLocalRequestAppliesLocalAuth(t *testing.T) {
+	client := &TunnelClient{config: &DeviceConfig{}, localPort: "4096", localAuthUser: "opencode", localAuthPassword: "local-secret"}
+	req, status, message := client.newLocalRequest(&TunnelRequest{ID: "test", Method: http.MethodGet, Path: "/api/info"})
+	if req == nil {
+		t.Fatalf("newLocalRequest failed: %d %s", status, message)
+	}
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("opencode:local-secret"))
+	if got := req.Header.Get("Authorization"); got != want {
+		t.Fatalf("Authorization = %q, want %q", got, want)
 	}
 }
